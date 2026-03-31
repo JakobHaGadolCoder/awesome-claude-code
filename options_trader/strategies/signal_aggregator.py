@@ -38,6 +38,12 @@ class SignalAggregator:
     - Technical indicators composite (weight: config.weight_technical)
     - Support/Resistance signal (weight: config.weight_sr_levels)
     - Events signal (weight: config.weight_events)
+    - Price action signal (15% of adjusted weight)
+    - VWAP signal (10% of adjusted weight)
+    - MTF confluence signal (12% of adjusted weight — HTF gate)
+    - Divergence signal (8% of adjusted weight)
+    - Correlation signal (7% of adjusted weight)
+    - Session signal (modifier only — not scored, used in confidence)
 
     Applies regime-based adjustments to weights and overall confidence.
     """
@@ -55,46 +61,74 @@ class SignalAggregator:
         regime: MarketRegime,
         price_action_signal: Optional[TechnicalSignal] = None,
         vwap_signal: Optional[TechnicalSignal] = None,
+        mtf_signal: Optional[TechnicalSignal] = None,
+        divergence_signal: Optional[TechnicalSignal] = None,
+        correlation_signal: Optional[TechnicalSignal] = None,
+        session_signal: Optional[TechnicalSignal] = None,
         additional_signals: Optional[List[TechnicalSignal]] = None,
     ) -> AggregatedSignal:
         """
         Returns a single AggregatedSignal with direction and confidence.
-        Now includes price action and VWAP as first-class signal sources.
         """
         weights = self._get_regime_adjusted_weights(
             regime,
             has_price_action=price_action_signal is not None,
             has_vwap=vwap_signal is not None,
+            has_mtf=mtf_signal is not None,
+            has_divergence=divergence_signal is not None,
+            has_correlation=correlation_signal is not None,
         )
 
         components: Dict[str, TechnicalSignal] = {
             "order_flow": order_flow_signal,
-            "sr_levels": sr_signal,
-            "events": event_signal,
+            "sr_levels":  sr_signal,
+            "events":     event_signal,
         }
         if price_action_signal:
             components["price_action"] = price_action_signal
         if vwap_signal:
             components["vwap"] = vwap_signal
+        if mtf_signal:
+            components["mtf"] = mtf_signal
+        if divergence_signal:
+            components["divergence"] = divergence_signal
+        if correlation_signal:
+            components["correlation"] = correlation_signal
+        if session_signal:
+            components["session"] = session_signal
 
         weighted_score = (
             weights["order_flow"] * order_flow_signal.signal.value
-            + weights["technical"] * technical_score
-            + weights["sr_levels"] * sr_signal.signal.value
-            + weights["events"] * event_signal.signal.value
+            + weights["technical"]  * technical_score
+            + weights["sr_levels"]  * sr_signal.signal.value
+            + weights["events"]     * event_signal.signal.value
         )
 
-        # Price action: strong confluence signal — given high weight
+        # Price action: high-weight confluence signal
         if price_action_signal:
             weighted_score += weights.get("price_action", 0.15) * price_action_signal.signal.value
 
-        # VWAP: reclaim/rejection signals are very high conviction
+        # VWAP: reclaim/rejection events are very high conviction
         if vwap_signal:
             vwap_weight = weights.get("vwap", 0.10)
-            # Double weight on reclaim/rejection events
             if "RECLAIM" in vwap_signal.description or "REJECTION" in vwap_signal.description:
                 vwap_weight *= 2.0
             weighted_score += vwap_weight * vwap_signal.signal.value
+
+        # MTF: HTF bias alignment — apply full weight; neutral MTF = no boost/penalty
+        if mtf_signal:
+            mtf_weight = weights.get("mtf", 0.12)
+            weighted_score += mtf_weight * mtf_signal.value
+
+        # Divergence: counter-trend or continuation signal
+        if divergence_signal and divergence_signal.signal != SignalStrength.NEUTRAL:
+            div_weight = weights.get("divergence", 0.08)
+            weighted_score += div_weight * divergence_signal.signal.value
+
+        # Correlation: DXY headwind/tailwind
+        if correlation_signal and correlation_signal.signal != SignalStrength.NEUTRAL:
+            corr_weight = weights.get("correlation", 0.07)
+            weighted_score += corr_weight * correlation_signal.signal.value
 
         # Additional signals averaged in with small weight
         if additional_signals:
@@ -105,6 +139,10 @@ class SignalAggregator:
             order_flow_signal, technical_score, sr_signal, event_signal, regime,
             price_action_signal=price_action_signal,
             vwap_signal=vwap_signal,
+            mtf_signal=mtf_signal,
+            divergence_signal=divergence_signal,
+            correlation_signal=correlation_signal,
+            session_signal=session_signal,
         )
         direction = self._score_to_signal(weighted_score)
         rationale = self._build_rationale(
@@ -112,7 +150,8 @@ class SignalAggregator:
         )
 
         logger.info(
-            "Aggregated %s | score=%.3f | confidence=%.2f | direction=%s | regime=%s | PA=%s | VWAP=%s",
+            "Aggregated %s | score=%.3f | confidence=%.2f | direction=%s | regime=%s | "
+            "PA=%s | VWAP=%s | MTF=%s | Div=%s | Corr=%s",
             symbol,
             weighted_score,
             confidence,
@@ -120,6 +159,9 @@ class SignalAggregator:
             regime.value,
             price_action_signal.signal.name if price_action_signal else "N/A",
             vwap_signal.signal.name if vwap_signal else "N/A",
+            mtf_signal.signal.name if mtf_signal else "N/A",
+            divergence_signal.signal.name if divergence_signal else "N/A",
+            correlation_signal.signal.name if correlation_signal else "N/A",
         )
         return AggregatedSignal(
             symbol=symbol,
@@ -140,45 +182,56 @@ class SignalAggregator:
         regime: MarketRegime,
         has_price_action: bool = False,
         has_vwap: bool = False,
+        has_mtf: bool = False,
+        has_divergence: bool = False,
+        has_correlation: bool = False,
     ) -> Dict[str, float]:
         base = {
             "order_flow": self.config.weight_order_flow,
-            "technical": self.config.weight_technical,
-            "sr_levels": self.config.weight_sr_levels,
-            "events": self.config.weight_events,
+            "technical":  self.config.weight_technical,
+            "sr_levels":  self.config.weight_sr_levels,
+            "events":     self.config.weight_events,
         }
 
-        # Price action and VWAP take their budget from the existing weights
+        # Carve out budget for each new signal source
+        allocations = []
         if has_price_action:
-            pa_weight = 0.15
-            # Steal proportionally from other weights
-            base = {k: v * (1 - pa_weight) for k, v in base.items()}
-            base["price_action"] = pa_weight
-
+            allocations.append(("price_action", 0.15))
         if has_vwap:
-            vwap_weight = 0.10
-            base = {k: v * (1 - vwap_weight) for k, v in base.items()}
-            base["vwap"] = vwap_weight
+            allocations.append(("vwap", 0.10))
+        if has_mtf:
+            allocations.append(("mtf", 0.12))
+        if has_divergence:
+            allocations.append(("divergence", 0.08))
+        if has_correlation:
+            allocations.append(("correlation", 0.07))
+
+        for name, w in allocations:
+            base = {k: v * (1 - w) for k, v in base.items()}
+            base[name] = w
 
         # Regime adjustments
         if regime == MarketRegime.HIGH_VOLATILITY:
             base["order_flow"] = min(0.45, base["order_flow"] * 1.3)
-            base["technical"] = max(0.10, base["technical"] * 0.7)
+            base["technical"]  = max(0.10, base["technical"]  * 0.7)
             if "vwap" in base:
-                # VWAP more important during volatile sessions (institutional anchor)
                 base["vwap"] = min(0.20, base["vwap"] * 1.5)
         elif regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
             base["technical"] = min(0.40, base["technical"] * 1.2)
             base["sr_levels"] = max(0.08, base["sr_levels"] * 0.9)
             if "price_action" in base:
-                # Trend-following price action (BOS, structure) very reliable
                 base["price_action"] = min(0.25, base["price_action"] * 1.3)
+            if "mtf" in base:
+                # MTF more reliable in trends
+                base["mtf"] = min(0.20, base["mtf"] * 1.25)
         elif regime == MarketRegime.RANGING:
             base["sr_levels"] = min(0.35, base["sr_levels"] * 1.5)
             base["technical"] = max(0.10, base["technical"] * 0.8)
             if "vwap" in base:
-                # VWAP mean-reversion especially useful in ranging markets
                 base["vwap"] = min(0.20, base["vwap"] * 1.4)
+            if "divergence" in base:
+                # Divergence especially useful in ranges (mean-reversion signal)
+                base["divergence"] = min(0.15, base["divergence"] * 1.5)
 
         # Normalise to sum to 1.0
         total = sum(base.values())
@@ -197,15 +250,11 @@ class SignalAggregator:
         regime: MarketRegime,
         price_action_signal: Optional[TechnicalSignal] = None,
         vwap_signal: Optional[TechnicalSignal] = None,
+        mtf_signal: Optional[TechnicalSignal] = None,
+        divergence_signal: Optional[TechnicalSignal] = None,
+        correlation_signal: Optional[TechnicalSignal] = None,
+        session_signal: Optional[TechnicalSignal] = None,
     ) -> float:
-        """
-        Confidence is higher when:
-        - Multiple signals agree on direction
-        - Price action and VWAP confirm the thesis
-        - VWAP reclaim/rejection events boost confidence significantly
-        - Event risk is low
-        - Regime is trending
-        """
         signals_numeric = [
             order_flow.signal.value,
             technical_score,
@@ -216,23 +265,45 @@ class SignalAggregator:
             signals_numeric.append(price_action_signal.signal.value)
         if vwap_signal:
             signals_numeric.append(vwap_signal.signal.value)
+        if mtf_signal:
+            signals_numeric.append(mtf_signal.value)
+        if divergence_signal and divergence_signal.signal != SignalStrength.NEUTRAL:
+            signals_numeric.append(divergence_signal.signal.value)
+        if correlation_signal and correlation_signal.signal != SignalStrength.NEUTRAL:
+            signals_numeric.append(correlation_signal.signal.value)
 
-        # Count agreeing signals (same sign)
         bullish = sum(1 for s in signals_numeric if s > 0.25)
         bearish = sum(1 for s in signals_numeric if s < -0.25)
         agreement = max(bullish, bearish) / len(signals_numeric)
 
-        # VWAP reclaim/rejection are very high-conviction events — boost confidence
+        # VWAP reclaim/rejection = very high conviction
         if vwap_signal and (
             "RECLAIM" in vwap_signal.description or "REJECTION" in vwap_signal.description
         ):
             agreement = min(1.0, agreement + 0.15)
 
+        # MTF confluence alignment boosts confidence
+        if mtf_signal and mtf_signal.signal not in (SignalStrength.NEUTRAL,):
+            if abs(mtf_signal.value) >= 1.0:
+                agreement = min(1.0, agreement + 0.10)
+
+        # RSI + MACD dual divergence = very high conviction
+        if divergence_signal and "RSI + MACD both" in divergence_signal.description:
+            agreement = min(1.0, agreement + 0.12)
+
         base_confidence = 0.3 + 0.5 * agreement
+
+        # Session quality modifier
+        if session_signal:
+            liq = session_signal.value / 2.0  # normalise back to 0–1
+            if liq < 0.35:
+                base_confidence *= 0.7   # low liquidity = lower confidence
+            elif liq >= 0.90:
+                base_confidence = min(1.0, base_confidence * 1.08)
 
         # Event risk penalty
         if abs(events.signal.value) >= 1.0:
-            base_confidence *= 0.6  # binary event upcoming
+            base_confidence *= 0.6
         elif abs(events.signal.value) >= 0.3:
             base_confidence *= 0.85
 
@@ -281,4 +352,8 @@ class SignalAggregator:
             f"S/R: {components['sr_levels'].signal.name} — {components['sr_levels'].description}",
             f"Events: {components['events'].signal.name} — {components['events'].description}",
         ]
+        for key in ("price_action", "vwap", "mtf", "divergence", "correlation"):
+            if key in components:
+                sig = components[key]
+                parts.append(f"{key.upper()}: {sig.signal.name} — {sig.description[:80]}")
         return " | ".join(parts)

@@ -27,9 +27,13 @@ from options_trader.analyzers.events import EventsAnalyzer
 from options_trader.analyzers.options_greeks import BlackScholes, OptionsGreeksCalculator
 from options_trader.analyzers.price_action import PriceActionAnalyzer
 from options_trader.analyzers.vwap import VWAPAnalyzer
+from options_trader.analyzers.multi_timeframe import MultiTimeframeAnalyzer
+from options_trader.analyzers.divergence import DivergenceDetector
+from options_trader.analyzers.correlation import CorrelationAnalyzer
 from options_trader.strategies.signal_aggregator import SignalAggregator
 from options_trader.strategies.trade_selector import TradeSelector
 from options_trader.utils.logger import setup_logger
+from options_trader.utils.session_filter import SessionFilter
 
 setup_logger("options_trader", "INFO")
 logger = logging.getLogger("demo")
@@ -45,7 +49,7 @@ def make_synthetic_ohlcv(n: int = 120, seed: int = 42) -> pd.DataFrame:
         prices.append(price)
     prices = np.array(prices)
     highs = prices * (1 + rng.uniform(0, 0.01, n))
-    lows = prices * (1 - rng.uniform(0, 0.01, n))
+    lows  = prices * (1 - rng.uniform(0, 0.01, n))
     opens = prices * (1 + rng.normal(0, 0.003, n))
     volumes = rng.integers(5_000_000, 30_000_000, n).astype(float)
 
@@ -203,8 +207,73 @@ def run_demo():
         print(f"    ⚠ Extended {abs(vwap_ctx.deviation_pct)*100:.1f}% from VWAP — mean reversion candidate")
     print(f"    VWAP Signal: {vwap_signal.signal.name}  —  {vwap_signal.description}")
 
+    # --- Multi-Timeframe Confluence ---
+    print("\n[7] Multi-Timeframe Confluence")
+    mtf_analyzer = MultiTimeframeAnalyzer(config)
+    # Build MTF frames by resampling (demo uses daily as base)
+    ohlcv_by_tf = {
+        "D1": ohlcv,
+        "H4": ohlcv.tail(60),   # treat recent 60 bars as "H4" proxy
+        "H1": ohlcv.tail(30),   # treat recent 30 bars as "H1" proxy
+    }
+    mtf_result = mtf_analyzer.analyze(symbol, ohlcv_by_tf)
+    print(f"    HTF Bias:     {mtf_result.htf_bias.upper()}")
+    print(f"    Confluence:   {mtf_result.confluence_score:.0%}")
+    print(f"    LTF Aligned:  {mtf_result.ltf_aligned}")
+    print(f"    Can Trade:    {mtf_result.can_trade}")
+    if mtf_result.suppression_reason:
+        print(f"    ⚠ SUPPRESSED: {mtf_result.suppression_reason}")
+    for tf, bias in sorted(mtf_result.timeframe_biases.items()):
+        print(f"      [{tf:3s}] {bias.trend.upper():7s}  RSI={bias.rsi:.0f}  EMA={'aligned' if bias.ema_aligned else 'mixed'}")
+    print(f"    MTF Signal:  {mtf_result.signal.signal.name}  —  {mtf_result.signal.description}")
+
+    # --- Divergence Detection ---
+    print("\n[8] RSI + MACD Divergence")
+    div_detector = DivergenceDetector(config)
+    div_result = div_detector.analyze(symbol, ohlcv)
+    print(f"    RSI:          {div_result.rsi_value:.1f}")
+    print(f"    MACD Hist:    {div_result.macd_histogram:+.4f}")
+    print(f"    RSI divs:     {len(div_result.rsi_divergences)}")
+    print(f"    MACD divs:    {len(div_result.macd_divergences)}")
+    if div_result.rsi_divergences or div_result.macd_divergences:
+        all_divs = div_result.rsi_divergences + div_result.macd_divergences
+        for d in all_divs[:4]:
+            print(f"      [{d.divergence_type:20s}] conf={d.confidence:.2f}  —  {d.description}")
+    print(f"    Div Signal:  {div_result.combined_signal.signal.name}  —  {div_result.combined_signal.description}")
+
+    # --- Session Filter ---
+    print("\n[9] Session Filter")
+    session_filter = SessionFilter(config)
+    session_info = session_filter.analyze(symbol)
+    print(f"    Session:      {session_info.session_name.upper()}")
+    print(f"    UTC Time:     {session_info.utc_time.strftime('%H:%M UTC')}")
+    print(f"    Liquidity:    {session_info.liquidity_score:.0%}")
+    print(f"    Reliability:  {session_info.trend_reliability:.0%}")
+    print(f"    Tradeable:    {session_info.is_tradeable}")
+    print(f"    Overlap:      {session_info.is_overlap}")
+    print(f"    Notes:        {session_info.notes}")
+    print(f"    Session Sig:  {session_info.signal.signal.name}  —  {session_info.signal.description[:70]}")
+    is_hvw, hvw_reason = SessionFilter.is_high_value_window()
+    print(f"    High-Value Window: {'YES' if is_hvw else 'no'}  ({hvw_reason})")
+
+    # --- DXY Correlation ---
+    print("\n[10] DXY / Macro Correlation")
+    corr_analyzer = CorrelationAnalyzer(config)
+    # Simulate a DXY proxy (inverse of SPY for demo purposes)
+    dxy_proxy = ohlcv.copy()
+    dxy_proxy["close"] = 100.0 / (ohlcv["close"] / ohlcv["close"].iloc[0])  # inverse proxy
+    corr_result = corr_analyzer.analyze(symbol, ohlcv, correlated_ohlcv=dxy_proxy, correlated_symbol="DXY_proxy")
+    print(f"    Correlated:   {corr_result.correlated_asset}")
+    print(f"    r(20):        {corr_result.correlation_20:+.3f}")
+    print(f"    r(50):        {corr_result.correlation_50:+.3f}")
+    print(f"    Strength:     {corr_result.correlation_strength}")
+    print(f"    DXY Trend:    {corr_result.dxy_trend}")
+    print(f"    Risk Regime:  {corr_result.risk_regime}")
+    print(f"    Suppression:  {'YES — ' + corr_result.suppression_reason if corr_result.suppression_active else 'no'}")
+    print(f"    Corr Signal:  {corr_result.signal.signal.name}  —  {corr_result.signal.description[:70]}")
+
     # --- Greeks Demo ---
-    print("\n[7] Black-Scholes Greeks")
+    print("\n[11] Black-Scholes Greeks")
     calc = OptionsGreeksCalculator()
     atm_call = next(
         (c for c in chain if c.option_type == OptionType.CALL and abs(c.strike - current_price) < 10 and (c.expiration - datetime.utcnow()).days > 25),
@@ -214,8 +283,8 @@ def run_demo():
     print(f"    {symbol} CALL ${atm_call.strike:.0f} {atm_call.expiration.date()}")
     print(f"    Price=${g.price:.2f}  Delta={g.delta:+.3f}  Gamma={g.gamma:.5f}  Theta={g.theta:+.4f}/day  Vega={g.vega:.4f}/1%IV")
 
-    # --- Signal Aggregation ---
-    print("\n[8] Signal Aggregation (All Sources)")
+    # --- Signal Aggregation (All Sources) ---
+    print("\n[12] Signal Aggregation (All Sources)")
     aggregator = SignalAggregator(config)
     agg = aggregator.aggregate(
         symbol=symbol,
@@ -226,6 +295,10 @@ def run_demo():
         regime=regime,
         price_action_signal=pa_result.signal,
         vwap_signal=vwap_signal,
+        mtf_signal=mtf_result.signal,
+        divergence_signal=div_result.combined_signal,
+        correlation_signal=corr_result.signal,
+        session_signal=session_info.signal,
         additional_signals=signals,
     )
     print(f"    Composite Score:  {agg.composite_score:+.3f}")
@@ -237,7 +310,7 @@ def run_demo():
         print(f"      {k:15s} → {v.signal.name:12s}  {v.description[:60]}")
 
     # --- Trade Selection ---
-    print("\n[9] Trade Selection")
+    print("\n[13] Trade Selection")
     selector = TradeSelector(config)
     trade = selector.select_trade(agg, chain, config.paper_trading_capital)
     if trade:
@@ -254,7 +327,7 @@ def run_demo():
         print("    No valid trade signal (thresholds not met)")
 
     # --- Backtest (quick) ---
-    print("\n[10] Backtesting (synthetic 120-day run)")
+    print("\n[14] Backtesting (synthetic 120-day run)")
     from options_trader.backtesting.backtester import Backtester
     bt_config = TradingConfig(paper_trading_capital=100_000, log_level="WARNING")
     backtester = Backtester(bt_config)
