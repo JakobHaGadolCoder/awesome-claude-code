@@ -291,16 +291,28 @@ class VWAPAnalyzer:
             score -= 1.5
             reasons.append(f"VWAP REJECTION — price broke below {bands.vwap:.2f} (bearish)")
 
-        # --- Band position scoring ---
+        # ================================================================
+        # BAND POSITION SCORING — post-mortem fix 31 Mar
+        #
+        # Previous error: "below_1s" was scored -0.5 (bearish momentum)
+        # This caused the system to CONFIRM bearish bias when price was
+        # already extended below VWAP — exactly the wrong call at extremes.
+        #
+        # Fix: At -1σ or lower with an extended move, flip to MEAN REVERSION.
+        # The score below -1σ is now BULLISH (snap-back potential).
+        # Only score bearish momentum when price first breaks below VWAP
+        # (above_vwap → below_vwap transition), not at extremes.
+        # ================================================================
         band_scores = {
-            "above_3s":  (-1.0, f"Extreme extension above +3σ ({bands.upper_3:.2f}) — mean reversion risk"),
-            "above_2s":  (-0.5, f"Extended above +2σ ({bands.upper_2:.2f}) — overbought vs VWAP"),
-            "above_1s":  (0.5,  f"Above +1σ band ({bands.upper_1:.2f}) — bullish momentum"),
+            "above_3s":  (-1.5, f"Extreme +3σ ({bands.upper_3:.2f}) — STRONG mean-reversion SHORT"),
+            "above_2s":  (-1.0, f"Above +2σ ({bands.upper_2:.2f}) — overbought, fade the extension"),
+            "above_1s":  (0.5,  f"Above +1σ ({bands.upper_1:.2f}) — bullish momentum"),
             "above_vwap":(0.3,  f"Above VWAP ({bands.vwap:.2f}) — buyers in control"),
             "below_vwap":(-0.3, f"Below VWAP ({bands.vwap:.2f}) — sellers in control"),
-            "below_1s":  (-0.5, f"Below -1σ ({bands.lower_1:.2f}) — bearish momentum"),
-            "below_2s":  (0.5,  f"Extended below -2σ ({bands.lower_2:.2f}) — oversold, bounce candidate"),
-            "below_3s":  (1.0,  f"Extreme below -3σ ({bands.lower_3:.2f}) — capitulation / strong reversal zone"),
+            # FIXED: below -1σ is now BULLISH mean-reversion, not bearish momentum
+            "below_1s":  (0.5,  f"Below -1σ ({bands.lower_1:.2f}) — oversold vs VWAP, snap-back candidate"),
+            "below_2s":  (1.0,  f"Below -2σ ({bands.lower_2:.2f}) — STRONG mean-reversion LONG"),
+            "below_3s":  (1.5,  f"Below -3σ ({bands.lower_3:.2f}) — extreme capitulation, HIGH-PROB reversal"),
         }
 
         if ctx.band_position in band_scores and not ctx.is_reclaim and not ctx.is_rejection:
@@ -308,21 +320,36 @@ class VWAPAnalyzer:
             score += s
             reasons.append(desc)
 
-        # --- VWAP slope ---
+        # --- VWAP slope (reduced weight when price is extended) ---
+        # Post-mortem fix: don't let a falling VWAP override an extreme extension signal
+        slope_weight = 0.15 if ctx.is_extended else 0.3
         if ctx.vwap_trend == "rising":
-            score += 0.3
+            score += slope_weight
             reasons.append(f"VWAP rising (slope={bands.slope:+.3f}) — bullish drift")
         elif ctx.vwap_trend == "falling":
-            score -= 0.3
+            score -= slope_weight
             reasons.append(f"VWAP falling (slope={bands.slope:+.3f}) — bearish drift")
 
-        # --- Extension warning ---
+        # --- Extension warning (now generates an actionable signal) ---
         if ctx.is_extended:
             sign = "above" if ctx.deviation_pct > 0 else "below"
-            reasons.append(
-                f"⚠ Price {abs(ctx.deviation_pct)*100:.1f}% {sign} VWAP — "
-                f"{'mean reversion risk' if ctx.deviation_pct > 0 else 'snap-back potential'}"
-            )
+            ext_pct = abs(ctx.deviation_pct) * 100
+            if ctx.deviation_pct < 0:
+                # Extended BELOW VWAP → mean reversion LONG signal
+                mr_score = min(1.0, ext_pct / 1.5)   # stronger the extension, stronger the signal
+                score += mr_score
+                reasons.append(
+                    f"⚡ MEAN REVERSION SIGNAL: {ext_pct:.1f}% below VWAP "
+                    f"(+{mr_score:.2f} score) — snap-back to {bands.vwap:.2f} expected"
+                )
+            else:
+                # Extended ABOVE VWAP → mean reversion SHORT signal
+                mr_score = min(1.0, ext_pct / 1.5)
+                score -= mr_score
+                reasons.append(
+                    f"⚡ MEAN REVERSION SIGNAL: {ext_pct:.1f}% above VWAP "
+                    f"(-{mr_score:.2f} score) — pullback to {bands.vwap:.2f} expected"
+                )
 
         signal = self._score_to_signal(score)
         desc_str = " | ".join(reasons) if reasons else f"Price at VWAP ({bands.vwap:.2f})"

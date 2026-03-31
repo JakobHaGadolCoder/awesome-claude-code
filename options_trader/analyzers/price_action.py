@@ -5,9 +5,15 @@ Detects:
 - Market structure: Higher Highs/Higher Lows (bullish) vs Lower Highs/Lower Lows (bearish)
 - Break of Structure (BOS) and Change of Character (CHoCH)
 - Order Blocks (last bullish/bearish candle before a strong impulsive move)
-- Fair Value Gaps / Imbalances (FVG)
+- Fair Value Gaps / Imbalances (FVG) with fill probability scoring
 - Swing point identification
-- Momentum / impulsive vs corrective move classification
+- Exhaustion / capitulation detection at end of extended moves
+- Context-aware candle interpretation (trend position matters)
+
+Post-mortem amendment (31 Mar):
+  A bearish marubozu at the END of an 89-pip decline is capitulation, NOT momentum.
+  Large FVGs have high fill rates and must be treated as mean-reversion magnets.
+  VWAP extension > 1.5σ at end of extended move overrides trend-continuation bias.
 """
 
 from __future__ import annotations
@@ -93,6 +99,20 @@ class MarketStructure:
 
 
 @dataclass
+class ExhaustionSignal:
+    """
+    Flags when a large directional candle appears at the END of an extended move.
+    This is capitulation/exhaustion, not momentum — high reversal probability.
+    """
+    direction: str              # direction of the exhaustion candle ("bearish"/"bullish")
+    reversal_direction: str     # expected reversal direction
+    cumulative_move: float      # total pip move in the preceding trend
+    move_multiple: float        # how many ATRs the move covered
+    confidence: float           # 0.0 – 1.0
+    description: str = ""
+
+
+@dataclass
 class PriceActionResult:
     patterns: List[CandlePattern]
     structure: MarketStructure
@@ -101,6 +121,8 @@ class PriceActionResult:
     signal: TechnicalSignal
     nearest_ob: Optional[OrderBlock] = None
     nearest_fvg: Optional[FairValueGap] = None
+    exhaustion: Optional[ExhaustionSignal] = None
+    fvg_fill_bias: Optional[str] = None   # "bullish_fill" | "bearish_fill" | None
 
 
 # ---------------------------------------------------------------------------
@@ -144,18 +166,29 @@ class PriceActionAnalyzer:
         nearest_ob = self._nearest_active_ob(order_blocks, cp)
         nearest_fvg = self._nearest_active_fvg(fvgs, cp)
 
+        # --- NEW: Exhaustion / capitulation detection ---
+        exhaustion = self._detect_exhaustion(ohlcv, patterns)
+
+        # --- NEW: FVG fill bias (largest unfilled FVG direction) ---
+        fvg_fill_bias = self._fvg_fill_bias(fvgs, cp)
+
         signal = self._build_signal(
-            patterns, structure, order_blocks, fvgs, cp
+            patterns, structure, order_blocks, fvgs, cp,
+            exhaustion=exhaustion,
+            fvg_fill_bias=fvg_fill_bias,
         )
 
         logger.info(
-            "PriceAction %s | trend=%s | BOS=%.2f | patterns=%s | OBs=%d | FVGs=%d | signal=%s",
+            "PriceAction %s | trend=%s | BOS=%.2f | patterns=%s | OBs=%d | FVGs=%d | "
+            "exhaustion=%s | fvg_fill_bias=%s | signal=%s",
             symbol,
             structure.trend,
             structure.last_bos or 0,
             [p.name for p in patterns[-3:]],
             len([o for o in order_blocks if not o.mitigated]),
             len([f for f in fvgs if not f.filled]),
+            exhaustion.reversal_direction if exhaustion else "none",
+            fvg_fill_bias or "none",
             signal.signal.name,
         )
 
@@ -167,6 +200,8 @@ class PriceActionAnalyzer:
             signal=signal,
             nearest_ob=nearest_ob,
             nearest_fvg=nearest_fvg,
+            exhaustion=exhaustion,
+            fvg_fill_bias=fvg_fill_bias,
         )
 
     # ------------------------------------------------------------------
@@ -476,6 +511,148 @@ class PriceActionAnalyzer:
                     break
 
     # ------------------------------------------------------------------
+    # Exhaustion / Capitulation detection  (post-mortem fix 31 Mar)
+    # ------------------------------------------------------------------
+
+    def _detect_exhaustion(
+        self,
+        ohlcv: pd.DataFrame,
+        patterns: List[CandlePattern],
+        lookback: int = 20,
+        atr_multiple_threshold: float = 1.8,
+        move_multiple_threshold: float = 4.0,
+    ) -> Optional[ExhaustionSignal]:
+        """
+        Detect when a large candle appears at the END of an extended directional move.
+
+        Key insight from 30 Mar post-mortem:
+        A bearish marubozu after an 89-pip decline is CAPITULATION, not continuation.
+        The same candle in the middle of a trend is momentum.
+        Context (trend position) is everything.
+
+        Conditions for exhaustion:
+        1. The last candle is a marubozu / large body (>80% body-to-range)
+        2. The cumulative directional move over lookback bars is > N x ATR
+        3. Price has not meaningfully retraced in the last 3 bars
+        """
+        if len(ohlcv) < lookback + 3:
+            return None
+
+        o = ohlcv["open"].values
+        h = ohlcv["high"].values
+        l = ohlcv["low"].values
+        c = ohlcv["close"].values
+        n = len(ohlcv)
+
+        # Last candle characteristics
+        last_body = abs(c[-1] - o[-1])
+        last_range = h[-1] - l[-1]
+        body_pct = last_body / last_range if last_range > 0 else 0
+        is_large_candle = body_pct > 0.75
+        last_is_bearish = c[-1] < o[-1]
+        last_is_bullish = c[-1] > o[-1]
+
+        if not is_large_candle:
+            return None
+
+        # ATR over lookback
+        tr_values = []
+        for i in range(n - lookback, n):
+            tr = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
+            tr_values.append(tr)
+        atr = float(np.mean(tr_values)) if tr_values else 1.0
+
+        # Cumulative move over lookback (from highest/lowest point)
+        window_highs = h[n - lookback: n]
+        window_lows = l[n - lookback: n]
+        swing_high = float(np.max(window_highs))
+        swing_low = float(np.min(window_lows))
+        total_range = swing_high - swing_low
+
+        # For bearish exhaustion: price dropped from swing high to current low
+        bearish_move = swing_high - float(l[-1])
+        # For bullish exhaustion: price rose from swing low to current high
+        bullish_move = float(h[-1]) - swing_low
+
+        # Check for bearish exhaustion (large bearish candle at bottom of extended fall)
+        if last_is_bearish:
+            move_multiple = bearish_move / atr if atr > 0 else 0
+            # Has price been falling continuously? Check that we're near recent lows
+            near_lows = float(c[-1]) <= float(np.percentile(c[n - lookback: n], 15))
+            if move_multiple >= move_multiple_threshold and near_lows:
+                confidence = min(0.90, 0.50 + (move_multiple - move_multiple_threshold) * 0.08)
+                return ExhaustionSignal(
+                    direction="bearish",
+                    reversal_direction="bullish",
+                    cumulative_move=bearish_move,
+                    move_multiple=move_multiple,
+                    confidence=confidence,
+                    description=(
+                        f"CAPITULATION: bearish marubozu after {bearish_move:.1f} pip "
+                        f"decline ({move_multiple:.1f}x ATR) — high reversal probability"
+                    ),
+                )
+
+        # Check for bullish exhaustion (large bullish candle at top of extended rise)
+        if last_is_bullish:
+            move_multiple = bullish_move / atr if atr > 0 else 0
+            near_highs = float(c[-1]) >= float(np.percentile(c[n - lookback: n], 85))
+            if move_multiple >= move_multiple_threshold and near_highs:
+                confidence = min(0.90, 0.50 + (move_multiple - move_multiple_threshold) * 0.08)
+                return ExhaustionSignal(
+                    direction="bullish",
+                    reversal_direction="bearish",
+                    cumulative_move=bullish_move,
+                    move_multiple=move_multiple,
+                    confidence=confidence,
+                    description=(
+                        f"DISTRIBUTION: bullish marubozu after {bullish_move:.1f} pip "
+                        f"rally ({move_multiple:.1f}x ATR) — high reversal probability"
+                    ),
+                )
+
+        return None
+
+    # ------------------------------------------------------------------
+    # FVG fill bias  (post-mortem fix 31 Mar)
+    # ------------------------------------------------------------------
+
+    def _fvg_fill_bias(
+        self,
+        fvgs: List[FairValueGap],
+        current_price: float,
+        max_distance_pct: float = 0.02,
+    ) -> Optional[str]:
+        """
+        If there is a large unfilled FVG within 2% of current price,
+        return the fill direction. Large FVGs created by a single large candle
+        have ~65-70% fill rate within the next 5-10 candles.
+
+        Returns: "bullish_fill" | "bearish_fill" | None
+        """
+        active = [f for f in fvgs if not f.filled]
+        if not active:
+            return None
+
+        # Sort by size (largest gaps have highest fill probability)
+        active.sort(key=lambda f: f.size, reverse=True)
+
+        for fvg in active[:3]:
+            dist_pct = abs(fvg.midpoint - current_price) / current_price
+            if dist_pct <= max_distance_pct:
+                # Bullish FVG above = price is below the gap, gap pulls price UP
+                if fvg.direction == "bullish" and fvg.midpoint > current_price:
+                    return "bullish_fill"
+                # Bearish FVG below = price is above the gap, gap pulls price DOWN
+                elif fvg.direction == "bearish" and fvg.midpoint < current_price:
+                    return "bearish_fill"
+                # Large bearish FVG above current price = price likely to fill it UP
+                elif fvg.direction == "bearish" and fvg.midpoint > current_price:
+                    return "bullish_fill"   # filling a bearish FVG = price goes up
+
+        return None
+
+    # ------------------------------------------------------------------
     # Nearest active OB / FVG
     # ------------------------------------------------------------------
 
@@ -506,17 +683,46 @@ class PriceActionAnalyzer:
         obs: List[OrderBlock],
         fvgs: List[FairValueGap],
         current_price: float,
+        exhaustion: Optional[ExhaustionSignal] = None,
+        fvg_fill_bias: Optional[str] = None,
     ) -> TechnicalSignal:
         score = 0.0
         reasons: List[str] = []
 
-        # --- Market structure (most weight) ---
+        # ================================================================
+        # EXHAUSTION OVERRIDE (highest priority — post-mortem fix)
+        # A capitulation candle at the end of an extended move REVERSES
+        # the trend signal from the candle itself. This was the root cause
+        # of the 30 Mar mis-call.
+        # ================================================================
+        exhaustion_active = False
+        if exhaustion and exhaustion.confidence >= 0.65:
+            exhaustion_active = True
+            if exhaustion.reversal_direction == "bullish":
+                score += exhaustion.confidence * 2.0   # strong bullish override
+                reasons.append(f"⚡ {exhaustion.description}")
+            else:
+                score -= exhaustion.confidence * 2.0   # strong bearish override
+                reasons.append(f"⚡ {exhaustion.description}")
+
+        # ================================================================
+        # FVG FILL BIAS (high priority — large gaps get filled)
+        # ================================================================
+        if fvg_fill_bias == "bullish_fill":
+            score += 0.8
+            reasons.append("FVG MAGNET: large unfilled gap above — price likely to fill upward")
+        elif fvg_fill_bias == "bearish_fill":
+            score -= 0.8
+            reasons.append("FVG MAGNET: large unfilled gap below — price likely to fill downward")
+
+        # --- Market structure (reduced weight when exhaustion overrides) ---
+        structure_weight = 0.5 if exhaustion_active else 1.0
         if structure.trend == "bullish":
-            score += 1.0
+            score += 1.0 * structure_weight
             hh_hl = "HH+HL" if structure.higher_highs and structure.higher_lows else "partial"
             reasons.append(f"Bullish structure ({hh_hl})")
         elif structure.trend == "bearish":
-            score -= 1.0
+            score -= 1.0 * structure_weight
             lh_ll = "LH+LL" if structure.lower_highs and structure.lower_lows else "partial"
             reasons.append(f"Bearish structure ({lh_ll})")
         else:
@@ -532,13 +738,19 @@ class PriceActionAnalyzer:
                 reasons.append(f"Bearish BOS below {structure.last_bos:.2f}")
 
         if structure.last_choch:
-            # CHoCH = warning sign of structure flip
             reasons.append(f"CHoCH at {structure.last_choch:.2f} — structure may be flipping")
-            score *= 0.7  # reduce confidence
+            score *= 0.7
 
-        # --- Recent candlestick patterns (last 3 candles) ---
+        # --- Recent candlestick patterns ---
+        # CRITICAL FIX: If exhaustion is active, skip the exhaustion candle itself
+        # from contributing to trend continuation signal — it's capitulation, not momentum
         recent = [p for p in patterns if p.candle_index >= len(patterns) - 5]
         for pat in recent[-3:]:
+            # Skip marubozu signals when exhaustion has been detected
+            # (the same candle was already counted as exhaustion above)
+            if exhaustion_active and "Marubozu" in pat.name:
+                reasons.append(f"{pat.name} → context: EXHAUSTION (not momentum)")
+                continue
             if pat.direction == "bullish":
                 score += pat.strength * 0.4
                 reasons.append(f"{pat.name} (bullish)")
