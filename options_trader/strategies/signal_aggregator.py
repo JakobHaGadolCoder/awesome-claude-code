@@ -53,18 +53,29 @@ class SignalAggregator:
         sr_signal: TechnicalSignal,
         event_signal: TechnicalSignal,
         regime: MarketRegime,
+        price_action_signal: Optional[TechnicalSignal] = None,
+        vwap_signal: Optional[TechnicalSignal] = None,
         additional_signals: Optional[List[TechnicalSignal]] = None,
     ) -> AggregatedSignal:
         """
         Returns a single AggregatedSignal with direction and confidence.
+        Now includes price action and VWAP as first-class signal sources.
         """
-        weights = self._get_regime_adjusted_weights(regime)
+        weights = self._get_regime_adjusted_weights(
+            regime,
+            has_price_action=price_action_signal is not None,
+            has_vwap=vwap_signal is not None,
+        )
 
-        components = {
+        components: Dict[str, TechnicalSignal] = {
             "order_flow": order_flow_signal,
             "sr_levels": sr_signal,
             "events": event_signal,
         }
+        if price_action_signal:
+            components["price_action"] = price_action_signal
+        if vwap_signal:
+            components["vwap"] = vwap_signal
 
         weighted_score = (
             weights["order_flow"] * order_flow_signal.signal.value
@@ -73,13 +84,27 @@ class SignalAggregator:
             + weights["events"] * event_signal.signal.value
         )
 
+        # Price action: strong confluence signal — given high weight
+        if price_action_signal:
+            weighted_score += weights.get("price_action", 0.15) * price_action_signal.signal.value
+
+        # VWAP: reclaim/rejection signals are very high conviction
+        if vwap_signal:
+            vwap_weight = weights.get("vwap", 0.10)
+            # Double weight on reclaim/rejection events
+            if "RECLAIM" in vwap_signal.description or "REJECTION" in vwap_signal.description:
+                vwap_weight *= 2.0
+            weighted_score += vwap_weight * vwap_signal.signal.value
+
         # Additional signals averaged in with small weight
         if additional_signals:
             extra_score = sum(s.signal.value for s in additional_signals) / len(additional_signals)
-            weighted_score = weighted_score * 0.9 + extra_score * 0.1
+            weighted_score = weighted_score * 0.92 + extra_score * 0.08
 
         confidence = self._compute_confidence(
-            order_flow_signal, technical_score, sr_signal, event_signal, regime
+            order_flow_signal, technical_score, sr_signal, event_signal, regime,
+            price_action_signal=price_action_signal,
+            vwap_signal=vwap_signal,
         )
         direction = self._score_to_signal(weighted_score)
         rationale = self._build_rationale(
@@ -87,12 +112,14 @@ class SignalAggregator:
         )
 
         logger.info(
-            "Aggregated %s | score=%.3f | confidence=%.2f | direction=%s | regime=%s",
+            "Aggregated %s | score=%.3f | confidence=%.2f | direction=%s | regime=%s | PA=%s | VWAP=%s",
             symbol,
             weighted_score,
             confidence,
             direction.name,
             regime.value,
+            price_action_signal.signal.name if price_action_signal else "N/A",
+            vwap_signal.signal.name if vwap_signal else "N/A",
         )
         return AggregatedSignal(
             symbol=symbol,
@@ -109,7 +136,10 @@ class SignalAggregator:
     # ------------------------------------------------------------------
 
     def _get_regime_adjusted_weights(
-        self, regime: MarketRegime
+        self,
+        regime: MarketRegime,
+        has_price_action: bool = False,
+        has_vwap: bool = False,
     ) -> Dict[str, float]:
         base = {
             "order_flow": self.config.weight_order_flow,
@@ -118,20 +148,39 @@ class SignalAggregator:
             "events": self.config.weight_events,
         }
 
-        if regime == MarketRegime.HIGH_VOLATILITY:
-            # In high-vol: order flow more important, technical less reliable
-            base["order_flow"] = min(0.45, base["order_flow"] * 1.3)
-            base["technical"] = max(0.15, base["technical"] * 0.7)
-        elif regime == MarketRegime.TRENDING_UP or regime == MarketRegime.TRENDING_DOWN:
-            # In trends: technical momentum + EMA signals are more reliable
-            base["technical"] = min(0.45, base["technical"] * 1.2)
-            base["sr_levels"] = max(0.10, base["sr_levels"] * 0.9)
-        elif regime == MarketRegime.RANGING:
-            # In ranges: S/R levels are king
-            base["sr_levels"] = min(0.40, base["sr_levels"] * 1.5)
-            base["technical"] = max(0.15, base["technical"] * 0.8)
+        # Price action and VWAP take their budget from the existing weights
+        if has_price_action:
+            pa_weight = 0.15
+            # Steal proportionally from other weights
+            base = {k: v * (1 - pa_weight) for k, v in base.items()}
+            base["price_action"] = pa_weight
 
-        # Normalise weights to sum to 1.0
+        if has_vwap:
+            vwap_weight = 0.10
+            base = {k: v * (1 - vwap_weight) for k, v in base.items()}
+            base["vwap"] = vwap_weight
+
+        # Regime adjustments
+        if regime == MarketRegime.HIGH_VOLATILITY:
+            base["order_flow"] = min(0.45, base["order_flow"] * 1.3)
+            base["technical"] = max(0.10, base["technical"] * 0.7)
+            if "vwap" in base:
+                # VWAP more important during volatile sessions (institutional anchor)
+                base["vwap"] = min(0.20, base["vwap"] * 1.5)
+        elif regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
+            base["technical"] = min(0.40, base["technical"] * 1.2)
+            base["sr_levels"] = max(0.08, base["sr_levels"] * 0.9)
+            if "price_action" in base:
+                # Trend-following price action (BOS, structure) very reliable
+                base["price_action"] = min(0.25, base["price_action"] * 1.3)
+        elif regime == MarketRegime.RANGING:
+            base["sr_levels"] = min(0.35, base["sr_levels"] * 1.5)
+            base["technical"] = max(0.10, base["technical"] * 0.8)
+            if "vwap" in base:
+                # VWAP mean-reversion especially useful in ranging markets
+                base["vwap"] = min(0.20, base["vwap"] * 1.4)
+
+        # Normalise to sum to 1.0
         total = sum(base.values())
         return {k: v / total for k, v in base.items()}
 
@@ -146,12 +195,16 @@ class SignalAggregator:
         sr: TechnicalSignal,
         events: TechnicalSignal,
         regime: MarketRegime,
+        price_action_signal: Optional[TechnicalSignal] = None,
+        vwap_signal: Optional[TechnicalSignal] = None,
     ) -> float:
         """
         Confidence is higher when:
         - Multiple signals agree on direction
+        - Price action and VWAP confirm the thesis
+        - VWAP reclaim/rejection events boost confidence significantly
         - Event risk is low
-        - Regime is trending (not high-vol or ranging)
+        - Regime is trending
         """
         signals_numeric = [
             order_flow.signal.value,
@@ -159,11 +212,21 @@ class SignalAggregator:
             sr.signal.value,
             events.signal.value,
         ]
+        if price_action_signal:
+            signals_numeric.append(price_action_signal.signal.value)
+        if vwap_signal:
+            signals_numeric.append(vwap_signal.signal.value)
 
         # Count agreeing signals (same sign)
         bullish = sum(1 for s in signals_numeric if s > 0.25)
         bearish = sum(1 for s in signals_numeric if s < -0.25)
         agreement = max(bullish, bearish) / len(signals_numeric)
+
+        # VWAP reclaim/rejection are very high-conviction events — boost confidence
+        if vwap_signal and (
+            "RECLAIM" in vwap_signal.description or "REJECTION" in vwap_signal.description
+        ):
+            agreement = min(1.0, agreement + 0.15)
 
         base_confidence = 0.3 + 0.5 * agreement
 

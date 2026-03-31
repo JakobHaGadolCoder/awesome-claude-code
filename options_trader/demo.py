@@ -25,6 +25,8 @@ from options_trader.analyzers.technical import TechnicalAnalyzer
 from options_trader.analyzers.support_resistance import SupportResistanceAnalyzer
 from options_trader.analyzers.events import EventsAnalyzer
 from options_trader.analyzers.options_greeks import BlackScholes, OptionsGreeksCalculator
+from options_trader.analyzers.price_action import PriceActionAnalyzer
+from options_trader.analyzers.vwap import VWAPAnalyzer
 from options_trader.strategies.signal_aggregator import SignalAggregator
 from options_trader.strategies.trade_selector import TradeSelector
 from options_trader.utils.logger import setup_logger
@@ -156,8 +158,53 @@ def run_demo():
     print(f"    Upcoming events: {[e.name for e in upcoming]}")
     print(f"    Signal: {ev_signal.signal.name}  —  {ev_signal.description}")
 
+    # --- Price Action Analysis ---
+    print("\n[5] Price Action Analysis")
+    pa_analyzer = PriceActionAnalyzer(config)
+    pa_result = pa_analyzer.analyze(symbol, ohlcv, current_price)
+    struct = pa_result.structure
+    print(f"    Market Structure: {struct.trend.upper()}"
+          + (" HH+HL" if struct.higher_highs and struct.higher_lows else "")
+          + (" LH+LL" if struct.lower_highs and struct.lower_lows else ""))
+    if struct.last_bos:
+        print(f"    Break of Structure (BOS): {struct.last_bos:.2f}")
+    if struct.last_choch:
+        print(f"    Change of Character (CHoCH): {struct.last_choch:.2f}  ⚠ structure flipping")
+    active_obs = [ob for ob in pa_result.order_blocks if not ob.mitigated]
+    active_fvgs = [f for f in pa_result.fvgs if not f.filled]
+    print(f"    Active Order Blocks: {len(active_obs)}")
+    for ob in active_obs[-3:]:
+        print(f"      {ob.direction.upper():8s} OB  {ob.price_low:.2f}–{ob.price_high:.2f}  {ob.description}")
+    print(f"    Active FVGs: {len(active_fvgs)}")
+    for fvg in active_fvgs[-3:]:
+        print(f"      {fvg.direction.upper():8s} FVG  {fvg.price_low:.2f}–{fvg.price_high:.2f}  (size={fvg.size:.2f})")
+    recent_pats = pa_result.patterns[-5:]
+    if recent_pats:
+        print(f"    Recent Candle Patterns:")
+        for p in recent_pats:
+            print(f"      [{p.direction.upper():7s}] {p.name:22s}  strength={p.strength:.2f}  — {p.description}")
+    print(f"    PA Signal: {pa_result.signal.signal.name}  —  {pa_result.signal.description}")
+
+    # --- VWAP Analysis ---
+    print("\n[6] VWAP Analysis")
+    vwap_analyzer = VWAPAnalyzer(config)
+    vwap_bands, vwap_ctx, vwap_signal = vwap_analyzer.analyze(symbol, ohlcv, session_reset=True)
+    dev_sign = "+" if vwap_ctx.deviation_pct >= 0 else ""
+    print(f"    VWAP:       {vwap_bands.vwap:.2f}  (price {dev_sign}{vwap_ctx.deviation_pct*100:.2f}% from VWAP)")
+    print(f"    +1σ / -1σ:  {vwap_bands.upper_1:.2f}  /  {vwap_bands.lower_1:.2f}")
+    print(f"    +2σ / -2σ:  {vwap_bands.upper_2:.2f}  /  {vwap_bands.lower_2:.2f}")
+    print(f"    Band pos:   {vwap_ctx.band_position}")
+    print(f"    VWAP trend: {vwap_ctx.vwap_trend}  (slope={vwap_bands.slope:+.3f})")
+    if vwap_ctx.is_reclaim:
+        print(f"    *** VWAP RECLAIM DETECTED — bullish high-conviction event ***")
+    if vwap_ctx.is_rejection:
+        print(f"    *** VWAP REJECTION DETECTED — bearish high-conviction event ***")
+    if vwap_ctx.is_extended:
+        print(f"    ⚠ Extended {abs(vwap_ctx.deviation_pct)*100:.1f}% from VWAP — mean reversion candidate")
+    print(f"    VWAP Signal: {vwap_signal.signal.name}  —  {vwap_signal.description}")
+
     # --- Greeks Demo ---
-    print("\n[5] Black-Scholes Greeks")
+    print("\n[7] Black-Scholes Greeks")
     calc = OptionsGreeksCalculator()
     atm_call = next(
         (c for c in chain if c.option_type == OptionType.CALL and abs(c.strike - current_price) < 10 and (c.expiration - datetime.utcnow()).days > 25),
@@ -168,7 +215,7 @@ def run_demo():
     print(f"    Price=${g.price:.2f}  Delta={g.delta:+.3f}  Gamma={g.gamma:.5f}  Theta={g.theta:+.4f}/day  Vega={g.vega:.4f}/1%IV")
 
     # --- Signal Aggregation ---
-    print("\n[6] Signal Aggregation")
+    print("\n[8] Signal Aggregation (All Sources)")
     aggregator = SignalAggregator(config)
     agg = aggregator.aggregate(
         symbol=symbol,
@@ -177,15 +224,20 @@ def run_demo():
         sr_signal=sr_signal,
         event_signal=ev_signal,
         regime=regime,
+        price_action_signal=pa_result.signal,
+        vwap_signal=vwap_signal,
         additional_signals=signals,
     )
     print(f"    Composite Score:  {agg.composite_score:+.3f}")
     print(f"    Direction:        {agg.direction.name}")
     print(f"    Confidence:       {agg.confidence*100:.0f}%")
     print(f"    Regime:           {agg.regime.value}")
+    print(f"    Signal Sources:")
+    for k, v in agg.component_signals.items():
+        print(f"      {k:15s} → {v.signal.name:12s}  {v.description[:60]}")
 
     # --- Trade Selection ---
-    print("\n[7] Trade Selection")
+    print("\n[9] Trade Selection")
     selector = TradeSelector(config)
     trade = selector.select_trade(agg, chain, config.paper_trading_capital)
     if trade:
@@ -202,7 +254,7 @@ def run_demo():
         print("    No valid trade signal (thresholds not met)")
 
     # --- Backtest (quick) ---
-    print("\n[8] Backtesting (synthetic 120-day run)")
+    print("\n[10] Backtesting (synthetic 120-day run)")
     from options_trader.backtesting.backtester import Backtester
     bt_config = TradingConfig(paper_trading_capital=100_000, log_level="WARNING")
     backtester = Backtester(bt_config)
