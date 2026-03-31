@@ -65,10 +65,31 @@ class TradingConfig:
     high_impact_days_window: int = 3       # flag events within 3 days
 
     # --- Broker / execution ---
-    broker: str = "paper"                  # "paper" | "alpaca" | "tradier" | "ibkr"
+    broker: str = "paper"                  # "paper" | "alpaca" | "tradier" | "ibkr" | "mt5"
     api_key: Optional[str] = None
     api_secret: Optional[str] = None
     paper_trading_capital: float = 100_000.0
+
+    # --- MetaTrader 5 settings ---
+    # Requires MT5 terminal running on Windows (or Linux + Wine).
+    # Install: pip install MetaTrader5
+    mt5_login: Optional[int] = None           # MT5 account number
+    mt5_password: Optional[str] = None        # MT5 account password
+    mt5_server: Optional[str] = None          # broker server (e.g. "ICMarkets-Live")
+    mt5_terminal_path: Optional[str] = None   # path to terminal64.exe (optional)
+    mt5_magic: int = 20250331                 # magic number to tag bot orders
+    mt5_deviation: int = 20                   # max slippage in points
+    mt5_risk_pct: float = 0.01                # risk 1% of balance per trade
+    mt5_min_lot: float = 0.01                 # minimum lot size
+    mt5_max_lot: float = 5.0                  # maximum lot size cap
+    mt5_poll_interval: int = 60               # live loop poll interval in seconds
+    mt5_timeframes: List[str] = field(        # timeframes to fetch for MTF analysis
+        default_factory=lambda: ["M15", "H1", "H4", "D1"]
+    )
+    mt5_symbols: List[str] = field(           # CFD symbols to trade (MT5 naming)
+        default_factory=lambda: ["XAUUSD"]
+    )
+    mt5_paper: bool = True                    # True = simulate orders, no real execution
 
     # --- Logging ---
     log_level: str = "INFO"
