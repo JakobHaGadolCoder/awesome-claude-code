@@ -172,15 +172,19 @@ class PriceActionAnalyzer:
         # --- NEW: FVG fill bias (largest unfilled FVG direction) ---
         fvg_fill_bias = self._fvg_fill_bias(fvgs, cp)
 
+        # --- NEW: Post-impulse correction mode (31 Mar post-mortem fix) ---
+        post_impulse = self._detect_post_impulse_correction(ohlcv)
+
         signal = self._build_signal(
             patterns, structure, order_blocks, fvgs, cp,
             exhaustion=exhaustion,
             fvg_fill_bias=fvg_fill_bias,
+            post_impulse=post_impulse,
         )
 
         logger.info(
             "PriceAction %s | trend=%s | BOS=%.2f | patterns=%s | OBs=%d | FVGs=%d | "
-            "exhaustion=%s | fvg_fill_bias=%s | signal=%s",
+            "exhaustion=%s | fvg_fill_bias=%s | post_impulse=%s | signal=%s",
             symbol,
             structure.trend,
             structure.last_bos or 0,
@@ -189,6 +193,7 @@ class PriceActionAnalyzer:
             len([f for f in fvgs if not f.filled]),
             exhaustion.reversal_direction if exhaustion else "none",
             fvg_fill_bias or "none",
+            post_impulse.get("direction", "none") if post_impulse else "none",
             signal.signal.name,
         )
 
@@ -614,6 +619,118 @@ class PriceActionAnalyzer:
         return None
 
     # ------------------------------------------------------------------
+    # Post-impulse correction mode  (post-mortem fix 31 Mar)
+    # ------------------------------------------------------------------
+
+    def _detect_post_impulse_correction(
+        self,
+        ohlcv: pd.DataFrame,
+        impulse_atr_threshold: float = 3.0,
+        lookback: int = 10,
+        retrace_max_pct: float = 0.70,
+    ) -> Optional[dict]:
+        """
+        Detect if price is currently in a CORRECTIVE PULLBACK within a larger impulse.
+
+        Root cause of 31 Mar failure:
+        The 4482→4618 spike (+136 pips) was a bullish impulse. The retrace to 4550
+        was a 50% Fibonacci correction WITHIN that impulse, not a new bearish trend.
+        Shorting the correction of a bullish impulse is low-probability.
+
+        Logic:
+        1. Find the most recent large impulse candle (body > impulse_atr_threshold × ATR)
+        2. Confirm price has subsequently retraced (partially pulling back from impulse)
+        3. If the retrace is ≤ 70% of the impulse, we are IN a correction, not a reversal
+        4. Return the impulse direction + 50%/61.8% Fibonacci retracement levels
+
+        Returns dict with:
+            direction: "bullish" | "bearish"  (impulse direction — DO NOT trade against this)
+            impulse_size: float
+            fib_50: float   (50% retrace price — highest hit-rate bounce level)
+            fib_618: float  (61.8% retrace price)
+            retrace_pct: float  (how much of the impulse has been retraced so far)
+            description: str
+        """
+        df = ohlcv.tail(lookback + 5).copy()
+        df.columns = [c.lower() for c in df.columns]
+        o = df["open"].values
+        h = df["high"].values
+        l = df["low"].values
+        c = df["close"].values
+        n = len(df)
+
+        if n < 5:
+            return None
+
+        # ATR over the window
+        trs = [max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1])) for i in range(1, n)]
+        atr = float(np.mean(trs)) if trs else 1.0
+
+        # Find most recent large impulse candle (within last lookback bars)
+        for i in range(n - 1, max(0, n - lookback - 1), -1):
+            body = abs(c[i] - o[i])
+            if body < impulse_atr_threshold * atr:
+                continue
+
+            is_bull_impulse = c[i] > o[i]
+            impulse_high = float(h[i])
+            impulse_low  = float(l[i])
+            impulse_size = impulse_high - impulse_low
+
+            current_price = float(c[-1])
+
+            if is_bull_impulse:
+                # Bull impulse: watch for pullback from the impulse high
+                if current_price >= impulse_high:
+                    continue  # price still at/above impulse high, no retrace yet
+                retrace_amount = impulse_high - current_price
+                retrace_pct = retrace_amount / impulse_size if impulse_size > 0 else 0
+                if retrace_pct > retrace_max_pct:
+                    continue  # retraced too much — probably a full reversal
+                # We are in a bullish post-impulse correction
+                fib_50  = impulse_high - 0.500 * impulse_size
+                fib_618 = impulse_high - 0.618 * impulse_size
+                return {
+                    "direction": "bullish",
+                    "impulse_size": impulse_size,
+                    "fib_50": round(fib_50, 2),
+                    "fib_618": round(fib_618, 2),
+                    "retrace_pct": round(retrace_pct, 3),
+                    "description": (
+                        f"POST-IMPULSE BULLISH CORRECTION: retraced {retrace_pct*100:.0f}% of "
+                        f"{impulse_size:.1f}-pip bull impulse. "
+                        f"50% Fib={fib_50:.2f}, 61.8% Fib={fib_618:.2f}. "
+                        f"DO NOT SHORT — trade with the impulse direction."
+                    ),
+                }
+
+            else:
+                # Bear impulse: watch for pullback from the impulse low
+                if current_price <= impulse_low:
+                    continue
+                retrace_amount = current_price - impulse_low
+                retrace_pct = retrace_amount / impulse_size if impulse_size > 0 else 0
+                if retrace_pct > retrace_max_pct:
+                    continue
+                fib_50  = impulse_low + 0.500 * impulse_size
+                fib_618 = impulse_low + 0.618 * impulse_size
+                return {
+                    "direction": "bearish",
+                    "impulse_size": impulse_size,
+                    "fib_50": round(fib_50, 2),
+                    "fib_618": round(fib_618, 2),
+                    "retrace_pct": round(retrace_pct, 3),
+                    "description": (
+                        f"POST-IMPULSE BEARISH CORRECTION: retraced {retrace_pct*100:.0f}% of "
+                        f"{impulse_size:.1f}-pip bear impulse. "
+                        f"50% Fib={fib_50:.2f}, 61.8% Fib={fib_618:.2f}. "
+                        f"DO NOT LONG — trade with the impulse direction."
+                    ),
+                }
+
+        return None
+
+    # ------------------------------------------------------------------
     # FVG fill bias  (post-mortem fix 31 Mar)
     # ------------------------------------------------------------------
 
@@ -685,9 +802,42 @@ class PriceActionAnalyzer:
         current_price: float,
         exhaustion: Optional[ExhaustionSignal] = None,
         fvg_fill_bias: Optional[str] = None,
+        post_impulse: Optional[dict] = None,
     ) -> TechnicalSignal:
         score = 0.0
         reasons: List[str] = []
+
+        # ================================================================
+        # POST-IMPULSE CORRECTION OVERRIDE (highest priority — 31 Mar fix)
+        # If we are in a corrective pullback within a larger impulse,
+        # SUPPRESS signals that trade AGAINST the impulse direction.
+        # The correction IS the entry opportunity, not the trade direction.
+        # ================================================================
+        if post_impulse:
+            imp_dir = post_impulse["direction"]
+            retrace = post_impulse["retrace_pct"]
+            fib50   = post_impulse["fib_50"]
+            fib618  = post_impulse["fib_618"]
+            near_fib = (
+                abs(current_price - fib50)  / current_price < 0.003 or
+                abs(current_price - fib618) / current_price < 0.003
+            )
+            if imp_dir == "bullish":
+                # Correction in a bullish impulse — bias is LONG at Fib levels
+                base_score = 1.2 if near_fib else 0.6
+                score += base_score
+                reasons.append(
+                    f"⚡ {post_impulse['description']}"
+                    + (f" ← AT FIB LEVEL, HIGH-PROB BOUNCE" if near_fib else "")
+                )
+            else:
+                # Correction in a bearish impulse — bias is SHORT at Fib levels
+                base_score = 1.2 if near_fib else 0.6
+                score -= base_score
+                reasons.append(
+                    f"⚡ {post_impulse['description']}"
+                    + (f" ← AT FIB LEVEL, HIGH-PROB REJECTION" if near_fib else "")
+                )
 
         # ================================================================
         # EXHAUSTION OVERRIDE (highest priority — post-mortem fix)

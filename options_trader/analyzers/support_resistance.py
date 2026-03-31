@@ -6,6 +6,16 @@ Detects key price levels using:
 - Round number / psychological levels
 - Previous day/week/month high-low
 - Options max-pain and gamma exposure (GEX) levels
+- Fibonacci retracement levels of the most recent significant impulse
+- Broken-level role-reversal detection (old resistance = new support)
+
+Post-mortem amendment (31 Mar):
+  The 50% Fibonacci retracement of the 4482→4618 impulse landed at 4550.
+  Price reversed from exactly 4549. The S/R module had no Fibonacci logic,
+  so this critical support was invisible to the system. Fixed by adding
+  Fibonacci retracement detection on the most recent impulse move.
+  Also added role-reversal check: a broken resistance level flips to support
+  and should SUPPRESS bearish signals when price pulls back to test it.
 """
 
 from __future__ import annotations
@@ -62,8 +72,9 @@ class SupportResistanceAnalyzer:
         if options_chain:
             levels.extend(self._max_pain_and_gex(options_chain, current_price))
 
+        levels.extend(self._fibonacci_levels(ohlcv, current_price))
         levels = self._merge_nearby_levels(levels, current_price)
-        signal = self._build_signal(levels, current_price)
+        signal = self._build_signal(levels, current_price, ohlcv)
 
         logger.info(
             "S/R %s | current=%.2f | levels=%d | nearest=%s",
@@ -311,6 +322,95 @@ class SupportResistanceAnalyzer:
         return levels
 
     # ------------------------------------------------------------------
+    # Fibonacci Retracement Levels  (KEY FIX — 31 Mar post-mortem)
+    # ------------------------------------------------------------------
+
+    def _fibonacci_levels(
+        self, ohlcv: pd.DataFrame, current_price: float, lookback: int = 50
+    ) -> List[SupportResistanceLevel]:
+        """
+        Detect the most recent significant impulse move (swing low → swing high
+        or swing high → swing low) within the last `lookback` bars and place
+        Fibonacci retracement levels at 23.6%, 38.2%, 50%, 61.8%, 78.6%.
+
+        These are the levels where corrective pullbacks most frequently reverse.
+        The 50% level in particular has the highest empirical hit rate.
+
+        Critical insight: if a large impulsive candle (>3× ATR) has recently
+        occurred, the 50% / 61.8% retracement is a HIGH-PROBABILITY bounce zone,
+        NOT a continuation zone. These levels must be flagged as strong support
+        (for bull impulse) or strong resistance (for bear impulse).
+        """
+        levels: List[SupportResistanceLevel] = []
+        df = ohlcv.tail(lookback).copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        highs = df["high"].values
+        lows  = df["low"].values
+
+        if len(highs) < 10:
+            return levels
+
+        # Find swing high and swing low within lookback
+        swing_high_idx = int(np.argmax(highs))
+        swing_low_idx  = int(np.argmin(lows))
+        swing_high = float(highs[swing_high_idx])
+        swing_low  = float(lows[swing_low_idx])
+
+        impulse_size = swing_high - swing_low
+        if impulse_size <= 0:
+            return levels
+
+        # Determine direction of the most recent impulse
+        # (whichever pivot came last determines current retracement direction)
+        if swing_high_idx > swing_low_idx:
+            # Bull impulse: low came first, then high — retracement is DOWN from high
+            origin, terminus = swing_low, swing_high
+            retrace_direction = "bullish_impulse"
+        else:
+            # Bear impulse: high came first, then low — retracement is UP from low
+            origin, terminus = swing_high, swing_low
+            retrace_direction = "bearish_impulse"
+
+        fib_ratios = {
+            "23.6%": 0.236,
+            "38.2%": 0.382,
+            "50.0%": 0.500,   # Highest hit-rate — the level that stopped us out
+            "61.8%": 0.618,   # Golden ratio — second highest hit-rate
+            "78.6%": 0.786,
+        }
+
+        for label, ratio in fib_ratios.items():
+            if retrace_direction == "bullish_impulse":
+                # Retracement levels below the swing high
+                fib_price = terminus - ratio * impulse_size
+                level_type = "support"
+                # 50% and 61.8% are highest-confidence bounce zones
+                strength = 0.90 if ratio in (0.500, 0.618) else 0.75
+            else:
+                # Retracement levels above the swing low
+                fib_price = terminus + ratio * impulse_size
+                level_type = "resistance"
+                strength = 0.90 if ratio in (0.500, 0.618) else 0.75
+
+            # Only include levels near current price (within 5%)
+            if abs(fib_price - current_price) / current_price <= 0.05:
+                levels.append(
+                    SupportResistanceLevel(
+                        price=round(fib_price, 2),
+                        level_type=level_type,
+                        strength=strength,
+                        timeframe="intraday",
+                        description=(
+                            f"Fib {label} retrace of {retrace_direction.replace('_', ' ')} "
+                            f"({swing_low:.2f}→{swing_high:.2f}, range={impulse_size:.2f})"
+                        ),
+                    )
+                )
+
+        return levels
+
+    # ------------------------------------------------------------------
     # Max Pain & Gamma Exposure (GEX)
     # ------------------------------------------------------------------
 
@@ -410,6 +510,7 @@ class SupportResistanceAnalyzer:
         self,
         levels: List[SupportResistanceLevel],
         current_price: float,
+        ohlcv: Optional[pd.DataFrame] = None,
     ) -> TechnicalSignal:
         nearest_support = None
         nearest_resistance = None
@@ -438,7 +539,55 @@ class SupportResistanceAnalyzer:
         sup_dist_pct = min_support_dist / current_price if current_price else 1.0
         res_dist_pct = min_resistance_dist / current_price if current_price else 1.0
 
-        # Price very close to strong support = buy signal
+        # ------------------------------------------------------------------
+        # Role-reversal check (KEY FIX — 31 Mar post-mortem)
+        # If price recently broke ABOVE a prior resistance level (bullish
+        # breakout), that level flips to support on the first pullback.
+        # Shorting into a role-reversed support is a low-probability trade.
+        # ------------------------------------------------------------------
+        role_reversal_support = None
+        if ohlcv is not None and len(ohlcv) >= 10:
+            role_reversal_support = self._detect_role_reversal_support(
+                levels, current_price, ohlcv
+            )
+
+        if role_reversal_support is not None:
+            # Price is pulling back to a former resistance now acting as support
+            sig = SignalStrength.STRONG_BUY
+            desc = (
+                f"ROLE-REVERSAL SUPPORT at {role_reversal_support.price:.2f} — "
+                f"prior resistance broken → now support. "
+                f"Shorting here is CONTRA-TREND. HIGH-PROB BOUNCE ZONE."
+            )
+            return TechnicalSignal(
+                indicator="SupportResistance",
+                value=2.0,
+                signal=sig,
+                description=desc,
+            )
+
+        # Fibonacci 50%/61.8% near current price = strong support/resistance
+        fib_near = [
+            lv for lv in levels
+            if "Fib 50" in lv.description or "Fib 61" in lv.description
+            if abs(lv.price - current_price) / current_price < 0.005
+        ]
+        if fib_near:
+            fib_lv = fib_near[0]
+            if fib_lv.level_type == "support":
+                sig = SignalStrength.STRONG_BUY
+                desc = f"Price at {fib_lv.description} — HIGH-PROBABILITY BOUNCE ZONE"
+            else:
+                sig = SignalStrength.STRONG_SELL
+                desc = f"Price at {fib_lv.description} — HIGH-PROBABILITY REJECTION ZONE"
+            return TechnicalSignal(
+                indicator="SupportResistance",
+                value=sig.value * 1.5,
+                signal=sig,
+                description=desc,
+            )
+
+        # Standard S/R signal
         if nearest_support and sup_dist_pct < 0.005 and nearest_support.strength > 0.7:
             sig = SignalStrength.STRONG_BUY
             desc = f"Price at strong support {nearest_support.price:.2f} ({nearest_support.description})"
@@ -465,6 +614,44 @@ class SupportResistanceAnalyzer:
             signal=sig,
             description=desc,
         )
+
+    def _detect_role_reversal_support(
+        self,
+        levels: List[SupportResistanceLevel],
+        current_price: float,
+        ohlcv: pd.DataFrame,
+        lookback: int = 20,
+        proximity_pct: float = 0.008,
+    ) -> Optional[SupportResistanceLevel]:
+        """
+        Returns a level if:
+        1. There is a prior resistance level within proximity_pct of current price
+        2. Price has recently broken and CLOSED above that level (confirming breakout)
+        3. Price is now pulling back to retest it from above
+
+        This is the core "role-reversal" pattern — broken resistance becomes support.
+        A pullback to this zone is a buy opportunity, NOT a short.
+        """
+        df = ohlcv.tail(lookback).copy()
+        df.columns = [c.lower() for c in df.columns]
+        closes = df["close"].values
+
+        for lv in levels:
+            if lv.level_type != "resistance":
+                continue
+            # Level must be near current price (we're testing it)
+            dist_pct = abs(lv.price - current_price) / current_price
+            if dist_pct > proximity_pct:
+                continue
+            # Current price must be at or slightly above the level (pullback retest)
+            if current_price < lv.price * 0.995:
+                continue
+            # There must have been a confirmed close above this level recently
+            closes_above = sum(1 for c in closes if c > lv.price * 1.002)
+            if closes_above >= 2:
+                return lv
+
+        return None
 
     def _nearest_level(
         self, levels: List[SupportResistanceLevel], current_price: float
