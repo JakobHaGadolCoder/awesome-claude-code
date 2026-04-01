@@ -175,16 +175,20 @@ class PriceActionAnalyzer:
         # --- NEW: Post-impulse correction mode (31 Mar post-mortem fix) ---
         post_impulse = self._detect_post_impulse_correction(ohlcv)
 
+        # --- NEW: Parabolic extension detection (1 Apr post-mortem fix) ---
+        parabolic = self._detect_parabolic_extension(ohlcv)
+
         signal = self._build_signal(
             patterns, structure, order_blocks, fvgs, cp,
             exhaustion=exhaustion,
             fvg_fill_bias=fvg_fill_bias,
             post_impulse=post_impulse,
+            parabolic=parabolic,
         )
 
         logger.info(
             "PriceAction %s | trend=%s | BOS=%.2f | patterns=%s | OBs=%d | FVGs=%d | "
-            "exhaustion=%s | fvg_fill_bias=%s | post_impulse=%s | signal=%s",
+            "exhaustion=%s | fvg_fill_bias=%s | post_impulse=%s | parabolic=%s | signal=%s",
             symbol,
             structure.trend,
             structure.last_bos or 0,
@@ -194,6 +198,7 @@ class PriceActionAnalyzer:
             exhaustion.reversal_direction if exhaustion else "none",
             fvg_fill_bias or "none",
             post_impulse.get("direction", "none") if post_impulse else "none",
+            f"{parabolic['direction']}×{parabolic['atr_multiple']}" if parabolic else "none",
             signal.signal.name,
         )
 
@@ -731,6 +736,85 @@ class PriceActionAnalyzer:
         return None
 
     # ------------------------------------------------------------------
+    # Parabolic Extension Detection  (KEY FIX — 1 Apr post-mortem)
+    # ------------------------------------------------------------------
+
+    def _detect_parabolic_extension(
+        self,
+        ohlcv: pd.DataFrame,
+        lookback: int = 20,
+        threshold_atr: float = 4.0,
+    ) -> Optional[dict]:
+        """
+        Detect when price has moved in a parabolic / over-extended fashion.
+
+        Lesson (1 Apr): The XAUUSD bull run from ~4600 → 4721 (~121 pts) on M15
+        was parabolic — approximately 8–10× ATR in 20 bars. In this condition:
+          - Mean-reversion probability is ELEVATED
+          - TP targets should be set at pre-impulse structural levels, NOT the spike high
+          - A sharp reversal from the spike high is the most likely outcome
+          - Entering late in a parabolic move carries asymmetric downside risk
+
+        Threshold: total directional move > threshold_atr × ATR(14) over lookback bars.
+
+        Returns dict with:
+            direction: "bullish" | "bearish"
+            move_size: float (points moved)
+            atr_multiple: float (how many ATRs the move represents)
+            pre_impulse_high: float (last consolidation high before the run)
+            pre_impulse_low:  float (last consolidation low before the run)
+            description: str
+        or None if no parabolic extension detected.
+        """
+        df = ohlcv.tail(lookback).copy()
+        df.columns = [c.lower() for c in df.columns]
+        n = len(df)
+
+        if n < 14:
+            return None
+
+        h = df["high"].values
+        l = df["low"].values
+        c = df["close"].values
+
+        # ATR(14)
+        trs = [max(h[i] - l[i], abs(h[i] - c[i-1]), abs(l[i] - c[i-1]))
+               for i in range(1, n)]
+        atr = float(sum(trs[-14:]) / min(14, len(trs)))
+        if atr == 0:
+            return None
+
+        # Directional move from lookback start to current close
+        start_price = float(df["open"].iloc[0])
+        end_price   = float(c[-1])
+        move        = end_price - start_price
+        atr_multiple = abs(move) / atr
+
+        if atr_multiple < threshold_atr:
+            return None
+
+        direction = "bullish" if move > 0 else "bearish"
+
+        # Pre-impulse consolidation boundaries (first quarter of the lookback)
+        quarter = max(1, n // 4)
+        pre_h = float(np.max(h[:quarter]))
+        pre_l = float(np.min(l[:quarter]))
+
+        return {
+            "direction": direction,
+            "move_size": round(abs(move), 2),
+            "atr_multiple": round(atr_multiple, 1),
+            "pre_impulse_high": round(pre_h, 2),
+            "pre_impulse_low": round(pre_l, 2),
+            "description": (
+                f"PARABOLIC EXTENSION: {direction.upper()} move of {abs(move):.1f} pts "
+                f"= {atr_multiple:.1f}× ATR. Mean-reversion risk ELEVATED. "
+                f"TP should target pre-impulse zone "
+                f"({pre_l:.2f}–{pre_h:.2f}), NOT the spike extremity."
+            ),
+        }
+
+    # ------------------------------------------------------------------
     # FVG fill bias  (post-mortem fix 31 Mar)
     # ------------------------------------------------------------------
 
@@ -803,9 +887,23 @@ class PriceActionAnalyzer:
         exhaustion: Optional[ExhaustionSignal] = None,
         fvg_fill_bias: Optional[str] = None,
         post_impulse: Optional[dict] = None,
+        parabolic: Optional[dict] = None,
     ) -> TechnicalSignal:
         score = 0.0
         reasons: List[str] = []
+
+        # ================================================================
+        # PARABOLIC EXTENSION WARNING (1 Apr fix — applied before scoring)
+        # When price is in a parabolic extension, late entries carry high
+        # reversal risk. The signal confidence is dampened and the rationale
+        # is flagged so the TP placement logic uses conservative targets.
+        # ================================================================
+        parabolic_dampener = 1.0
+        if parabolic:
+            reasons.append(f"⚠ {parabolic['description']}")
+            # Dampen all subsequent scoring by 30% — any signal in a parabolic
+            # move should be treated with reduced conviction
+            parabolic_dampener = 0.70
 
         # ================================================================
         # POST-IMPULSE CORRECTION OVERRIDE (highest priority — 31 Mar fix)
@@ -865,8 +963,8 @@ class PriceActionAnalyzer:
             score -= 0.8
             reasons.append("FVG MAGNET: large unfilled gap below — price likely to fill downward")
 
-        # --- Market structure (reduced weight when exhaustion overrides) ---
-        structure_weight = 0.5 if exhaustion_active else 1.0
+        # --- Market structure (reduced weight when exhaustion/parabolic active) ---
+        structure_weight = (0.5 if exhaustion_active else 1.0) * parabolic_dampener
         if structure.trend == "bullish":
             score += 1.0 * structure_weight
             hh_hl = "HH+HL" if structure.higher_highs and structure.higher_lows else "partial"

@@ -8,6 +8,7 @@ Detects key price levels using:
 - Options max-pain and gamma exposure (GEX) levels
 - Fibonacci retracement levels of the most recent significant impulse
 - Broken-level role-reversal detection (old resistance = new support)
+- Spike wick supply/demand zones (large wicks = rejected price levels)
 
 Post-mortem amendment (31 Mar):
   The 50% Fibonacci retracement of the 4482→4618 impulse landed at 4550.
@@ -16,6 +17,13 @@ Post-mortem amendment (31 Mar):
   Fibonacci retracement detection on the most recent impulse move.
   Also added role-reversal check: a broken resistance level flips to support
   and should SUPPRESS bearish signals when price pulls back to test it.
+
+Post-mortem amendment (1 Apr):
+  Price spiked to 4717 on a parabolic run, then rejected hard. A BUY trade
+  had TP set at 4714 — just below the spike high — which was unrealistic
+  because the spike itself created a SUPPLY ZONE at 4717. Large upper wicks
+  indicate supply; large lower wicks indicate demand. These must be detected
+  and registered as S/R levels so that TP placement respects them.
 """
 
 from __future__ import annotations
@@ -73,6 +81,7 @@ class SupportResistanceAnalyzer:
             levels.extend(self._max_pain_and_gex(options_chain, current_price))
 
         levels.extend(self._fibonacci_levels(ohlcv, current_price))
+        levels.extend(self._spike_wick_zones(ohlcv, current_price))
         levels = self._merge_nearby_levels(levels, current_price)
         signal = self._build_signal(levels, current_price, ohlcv)
 
@@ -404,6 +413,84 @@ class SupportResistanceAnalyzer:
                         description=(
                             f"Fib {label} retrace of {retrace_direction.replace('_', ' ')} "
                             f"({swing_low:.2f}→{swing_high:.2f}, range={impulse_size:.2f})"
+                        ),
+                    )
+                )
+
+        return levels
+
+    # ------------------------------------------------------------------
+    # Spike Wick Supply / Demand Zones  (KEY FIX — 1 Apr post-mortem)
+    # ------------------------------------------------------------------
+
+    def _spike_wick_zones(
+        self, ohlcv: pd.DataFrame, current_price: float, lookback: int = 30
+    ) -> List[SupportResistanceLevel]:
+        """
+        Detect large upper/lower wicks on recent candles and register them as
+        supply (upper wick) or demand (lower wick) zones.
+
+        Rationale: When price spikes above resistance and immediately reverses,
+        the wick high represents heavy institutional selling — a supply zone.
+        Placing a TP at or above this level is unrealistic because supply will
+        absorb any rally attempt. The TP must be capped BELOW the spike high.
+
+        A candle qualifies as a spike when:
+          upper_wick >= 2× body  AND  upper_wick >= 0.3% of price   → supply zone
+          lower_wick >= 2× body  AND  lower_wick >= 0.3% of price   → demand zone
+
+        Only levels within 5% of current price are included.
+        """
+        levels: List[SupportResistanceLevel] = []
+        df = ohlcv.tail(lookback).copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        for i in range(len(df)):
+            o = float(df["open"].iloc[i])
+            h = float(df["high"].iloc[i])
+            l = float(df["low"].iloc[i])
+            c_price = float(df["close"].iloc[i])
+
+            body = abs(c_price - o)
+            upper_wick = h - max(o, c_price)
+            lower_wick = min(o, c_price) - l
+
+            # Avoid flat/doji candles distorting results
+            if body < (h - l) * 0.02:
+                body = (h - l) * 0.05
+
+            # Upper spike → supply zone at the spike high
+            if (upper_wick >= body * 2.0
+                    and upper_wick >= current_price * 0.003
+                    and abs(h - current_price) / current_price <= 0.05):
+                levels.append(
+                    SupportResistanceLevel(
+                        price=round(h, 2),
+                        level_type="resistance",
+                        strength=0.85,
+                        timeframe="intraday",
+                        description=(
+                            f"Spike supply zone — upper wick {upper_wick:.2f} pts "
+                            f"({upper_wick/current_price*100:.2f}% of price). "
+                            f"TP must NOT exceed this level."
+                        ),
+                    )
+                )
+
+            # Lower spike → demand zone at the spike low
+            if (lower_wick >= body * 2.0
+                    and lower_wick >= current_price * 0.003
+                    and abs(l - current_price) / current_price <= 0.05):
+                levels.append(
+                    SupportResistanceLevel(
+                        price=round(l, 2),
+                        level_type="support",
+                        strength=0.85,
+                        timeframe="intraday",
+                        description=(
+                            f"Spike demand zone — lower wick {lower_wick:.2f} pts "
+                            f"({lower_wick/current_price*100:.2f}% of price). "
+                            f"SL must NOT be placed below this level."
                         ),
                     )
                 )

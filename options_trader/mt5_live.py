@@ -221,9 +221,10 @@ class MT5LiveBot:
             logger.info("%s: correlation suppression — skip entry", symbol)
             return
 
-        # 7. Calculate SL/TP from ATR
+        # 7. Calculate SL/TP from ATR, capped at nearest S/R
         sl, tp1, tp2, lot_size = self._calculate_trade_params(
-            symbol, ohlcv, direction, current_price
+            symbol, ohlcv, direction, current_price,
+            sr_levels=meta.get("sr_levels", []),
         )
         if sl is None:
             return
@@ -279,8 +280,9 @@ class MT5LiveBot:
             corr_result = self._run_correlation(symbol, ohlcv)
             meta["corr_suppressed"] = corr_result.suppression_active if corr_result else False
 
-            # S/R
-            _, sr_signal = self.sr_analyzer.analyze(symbol, ohlcv, current_price)
+            # S/R — capture levels for TP capping in trade params
+            sr_levels, sr_signal = self.sr_analyzer.analyze(symbol, ohlcv, current_price)
+            meta["sr_levels"] = sr_levels
 
             # Events (stub for CFD — no options events)
             _, event_signal = self.events_analyzer.analyze(symbol)
@@ -346,13 +348,18 @@ class MT5LiveBot:
         ohlcv: pd.DataFrame,
         direction: SignalStrength,
         current_price: float,
+        sr_levels: list = None,
     ):
         """
         Calculate SL, TP1, TP2, and lot size using ATR-based levels.
 
         SL  = 1.5× ATR below entry (BUY) or above entry (SELL)
-        TP1 = 2.5× ATR from entry (R:R ~1.67:1)
-        TP2 = 4.0× ATR from entry (R:R ~2.67:1)
+        TP1 = 2.5× ATR from entry, capped at nearest resistance (BUY) or support (SELL)
+        TP2 = 4.0× ATR from entry
+
+        Key fix (1 Apr): TP1 is now capped at the nearest significant S/R level
+        between entry and the raw ATR target. This prevents placing TP inside a
+        supply zone (e.g. a spike high) where price is unlikely to reach.
         """
         try:
             h = ohlcv["high"].values
@@ -366,19 +373,24 @@ class MT5LiveBot:
             atr = float(sum(trs[-14:]) / 14) if len(trs) >= 14 else float(sum(trs) / len(trs))
 
             sym_info = self.connector.symbol_info(symbol)
+            digits = sym_info.get("digits", 2)
             is_buy = direction in (SignalStrength.BUY, SignalStrength.STRONG_BUY)
 
             if is_buy:
-                sl  = round(current_price - 1.5 * atr, sym_info.get("digits", 2))
-                tp1 = round(current_price + 2.5 * atr, sym_info.get("digits", 2))
-                tp2 = round(current_price + 4.0 * atr, sym_info.get("digits", 2))
+                sl  = round(current_price - 1.5 * atr, digits)
+                tp1 = round(current_price + 2.5 * atr, digits)
+                tp2 = round(current_price + 4.0 * atr, digits)
             else:
-                sl  = round(current_price + 1.5 * atr, sym_info.get("digits", 2))
-                tp1 = round(current_price - 2.5 * atr, sym_info.get("digits", 2))
-                tp2 = round(current_price - 4.0 * atr, sym_info.get("digits", 2))
+                sl  = round(current_price + 1.5 * atr, digits)
+                tp1 = round(current_price - 2.5 * atr, digits)
+                tp2 = round(current_price - 4.0 * atr, digits)
+
+            # Cap TP1 at nearest significant S/R level (prevents TP inside supply/demand zone)
+            if sr_levels:
+                tp1 = self._cap_tp_at_sr(current_price, tp1, is_buy, sr_levels, digits)
 
             # Minimum R:R check
-            risk  = abs(current_price - sl)
+            risk   = abs(current_price - sl)
             reward = abs(current_price - tp1)
             if risk == 0 or (reward / risk) < self.config.min_risk_reward:
                 logger.warning("%s: R:R %.2f < min %.2f — skip",
@@ -398,6 +410,60 @@ class MT5LiveBot:
         except Exception as exc:
             logger.error("Trade param calculation failed for %s: %s", symbol, exc)
             return None, None, None, None
+
+    def _cap_tp_at_sr(
+        self,
+        entry: float,
+        tp: float,
+        is_buy: bool,
+        sr_levels: list,
+        digits: int = 2,
+        buffer_pct: float = 0.001,
+    ) -> float:
+        """
+        Cap TP before the nearest significant S/R level between entry and TP.
+
+        For BUY:  find resistance levels in (entry, tp) → cap TP just below nearest
+        For SELL: find support levels in (tp, entry)    → cap TP just above nearest
+
+        Only levels with strength >= 0.75 (significant levels including spike zones)
+        are considered. A 0.1% buffer is applied so TP sits clear of the zone.
+
+        Lesson (1 Apr): BUY trade had TP=4714 but spike high at 4717 created a
+        supply zone. The TP should have been 4703-4705 (pre-spike consolidation).
+        This function would have capped it there automatically.
+        """
+        if is_buy:
+            blocking = [
+                lv for lv in sr_levels
+                if lv.level_type == "resistance"
+                and entry < lv.price < tp
+                and lv.strength >= 0.75
+            ]
+            if blocking:
+                nearest = min(blocking, key=lambda lv: lv.price)
+                capped = round(nearest.price * (1 - buffer_pct), digits)
+                logger.info(
+                    "TP capped: %.2f → %.2f (resistance @ %.2f | %s)",
+                    tp, capped, nearest.price, nearest.description[:60],
+                )
+                return capped
+        else:
+            blocking = [
+                lv for lv in sr_levels
+                if lv.level_type == "support"
+                and tp < lv.price < entry
+                and lv.strength >= 0.75
+            ]
+            if blocking:
+                nearest = max(blocking, key=lambda lv: lv.price)
+                capped = round(nearest.price * (1 + buffer_pct), digits)
+                logger.info(
+                    "TP capped: %.2f → %.2f (support @ %.2f | %s)",
+                    tp, capped, nearest.price, nearest.description[:60],
+                )
+                return capped
+        return tp
 
     # ------------------------------------------------------------------
     # Position management
