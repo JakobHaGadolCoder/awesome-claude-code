@@ -360,6 +360,12 @@ class MT5LiveBot:
         Key fix (1 Apr): TP1 is now capped at the nearest significant S/R level
         between entry and the raw ATR target. This prevents placing TP inside a
         supply zone (e.g. a spike high) where price is unlikely to reach.
+
+        Key fix (2 Jun): Late-entry detection. When price has already moved
+        significantly in the trade direction before entry (>1.5× ATR), the remaining
+        distance to the structural target is smaller. TP multiplier is scaled down
+        proportionally so the R:R stays realistic rather than requiring price to
+        continue for a full 2.5× ATR from a late entry point.
         """
         try:
             h = ohlcv["high"].values
@@ -376,14 +382,28 @@ class MT5LiveBot:
             digits = sym_info.get("digits", 2)
             is_buy = direction in (SignalStrength.BUY, SignalStrength.STRONG_BUY)
 
+            # Late-entry detection: measure how far price has already moved in
+            # the trade direction over the last 10 bars vs ATR.
+            # If the prior move > 1.5× ATR, reduce TP multiplier to avoid
+            # setting an unreachable target. Minimum TP multiplier = 1.2×.
+            tp_mult = self._late_entry_tp_multiplier(
+                ohlcv, is_buy, atr, lookback=10
+            )
+
             if is_buy:
                 sl  = round(current_price - 1.5 * atr, digits)
-                tp1 = round(current_price + 2.5 * atr, digits)
-                tp2 = round(current_price + 4.0 * atr, digits)
+                tp1 = round(current_price + tp_mult * atr, digits)
+                tp2 = round(current_price + (tp_mult + 1.5) * atr, digits)
             else:
                 sl  = round(current_price + 1.5 * atr, digits)
-                tp1 = round(current_price - 2.5 * atr, digits)
-                tp2 = round(current_price - 4.0 * atr, digits)
+                tp1 = round(current_price - tp_mult * atr, digits)
+                tp2 = round(current_price - (tp_mult + 1.5) * atr, digits)
+
+            if tp_mult < 2.5:
+                logger.info(
+                    "%s late-entry detected — TP multiplier reduced %.1f× → %.1f× ATR",
+                    symbol, 2.5, tp_mult,
+                )
 
             # Cap TP1 at nearest significant S/R level (prevents TP inside supply/demand zone)
             if sr_levels:
@@ -402,14 +422,69 @@ class MT5LiveBot:
             lot_size = self.connector.calculate_lot_size(symbol, sl_pips)
 
             logger.info(
-                "%s params | price=%.2f | SL=%.2f (%+.1f) | TP1=%.2f | TP2=%.2f | lot=%.2f | ATR=%.2f",
-                symbol, current_price, sl, sl - current_price, tp1, tp2, lot_size, atr,
+                "%s params | price=%.2f | SL=%.2f (%+.1f) | TP1=%.2f | TP2=%.2f | "
+                "lot=%.2f | ATR=%.2f | TP_mult=%.1f×",
+                symbol, current_price, sl, sl - current_price, tp1, tp2,
+                lot_size, atr, tp_mult,
             )
             return sl, tp1, tp2, lot_size
 
         except Exception as exc:
             logger.error("Trade param calculation failed for %s: %s", symbol, exc)
             return None, None, None, None
+
+    def _late_entry_tp_multiplier(
+        self,
+        ohlcv: pd.DataFrame,
+        is_buy: bool,
+        atr: float,
+        lookback: int = 10,
+        full_mult: float = 2.5,
+        min_mult: float = 1.2,
+    ) -> float:
+        """
+        Detect if entry is late in an existing directional move and reduce TP
+        multiplier proportionally.
+
+        Lesson (2 Jun): A SHORT entered at 4488 after the move had already run
+        from 4530 (~42 pts, ~3× ATR) had TP set at 4459 — a full 2.5× ATR away.
+        The remaining structural distance to target was only ~1.5× ATR from entry,
+        making the TP unrealistic. The trade required exiting early with a moved SL.
+
+        Logic:
+        - Measure the directional move in the last `lookback` bars
+        - If the prior move already covers > 1.5× ATR in the trade direction,
+          the entry is "late"
+        - Scale TP multiplier down: full_mult × (1 - prior_move_ratio * 0.4)
+        - Floor at min_mult to always give a meaningful reward target
+        """
+        if atr == 0:
+            return full_mult
+
+        df = ohlcv.tail(lookback)
+        if len(df) < 3:
+            return full_mult
+
+        if is_buy:
+            # For BUY: measure how far price has already fallen (prior bear move)
+            prior_high = float(df["high"].max())
+            prior_low  = float(df["low"].min())
+            prior_move = prior_high - prior_low
+        else:
+            # For SELL: measure how far price has already risen (prior bull move)
+            prior_high = float(df["high"].max())
+            prior_low  = float(df["low"].min())
+            prior_move = prior_high - prior_low
+
+        prior_atr_ratio = prior_move / atr
+
+        if prior_atr_ratio <= 1.5:
+            return full_mult  # fresh entry — use standard multiplier
+
+        # Scale down: the more extended the prior move, the tighter the TP
+        reduction = min(0.5, (prior_atr_ratio - 1.5) * 0.15)
+        adjusted = round(max(min_mult, full_mult - reduction * full_mult), 1)
+        return adjusted
 
     def _cap_tp_at_sr(
         self,
