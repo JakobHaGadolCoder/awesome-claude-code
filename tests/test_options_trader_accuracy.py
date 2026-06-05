@@ -20,6 +20,8 @@ from options_trader.core.models import MarketRegime, SignalStrength
 from options_trader.analyzers.technical import TechnicalAnalyzer
 from options_trader.analyzers.divergence import DivergenceDetector
 from options_trader.analyzers.support_resistance import SupportResistanceAnalyzer
+from options_trader.analyzers.vwap import VWAPAnalyzer
+from options_trader.backtesting.cfd_backtester import CFDBacktester, CFDBacktestResult
 
 
 def _frame(closes, freq="15min", start="2026-06-01"):
@@ -75,3 +77,34 @@ def test_periodic_levels_use_calendar_not_bar_offsets():
     prev_day_high = df.resample("D").agg({"high": "max"}).dropna().iloc[-2]["high"]
     assert any(abs(lv.price - float(prev_day_high)) < 1e-6
                for lv in daily if lv.level_type == "resistance")
+
+
+def test_mean_reversion_toggle_changes_vwap_signal():
+    """The override flag must actually flip VWAP band scoring at an extreme."""
+    # Steady decline so the last close sits well below the session VWAP.
+    closes = np.linspace(4520, 4460, 120)
+    df = _frame(closes)
+
+    cfg_on = TradingConfig(); cfg_on.enable_mean_reversion_overrides = True
+    cfg_off = TradingConfig(); cfg_off.enable_mean_reversion_overrides = False
+    _, _, sig_on = VWAPAnalyzer(cfg_on).analyze("XAUUSD", df)
+    _, _, sig_off = VWAPAnalyzer(cfg_off).analyze("XAUUSD", df)
+
+    # ON treats "extended below VWAP" as a bullish snap-back; OFF as bearish
+    # momentum. The scores must therefore differ (and lean opposite ways).
+    assert sig_on.value != sig_off.value
+    assert sig_on.value > sig_off.value
+
+
+def test_cfd_backtester_runs_and_reports():
+    """Smoke: the bar-by-bar CFD backtester returns computable R stats."""
+    closes = 4400 + np.cumsum(0.6 + np.random.default_rng(5).normal(0, 2.0, 200))
+    df = _frame(closes)
+    res = CFDBacktester(TradingConfig()).run(df, label="smoke", warmup=80)
+    assert isinstance(res, CFDBacktestResult)
+    assert res.n >= 0
+    # stats must be finite / well-formed regardless of trade count
+    assert 0.0 <= res.win_rate <= 1.0
+    assert res.max_drawdown_r >= 0.0
+    for t in res.trades:
+        assert t.exit_price is not None and t.risk > 0

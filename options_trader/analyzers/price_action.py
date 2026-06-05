@@ -892,6 +892,17 @@ class PriceActionAnalyzer:
         score = 0.0
         reasons: List[str] = []
 
+        # Master switch for the contested mean-reversion override logic. When
+        # disabled (e.g. in a backtest A/B), parabolic/exhaustion/post-impulse/
+        # FVG-fill biases are skipped and only structure + patterns + OB/FVG
+        # proximity drive the signal (pure trend/momentum behaviour).
+        mr_overrides = getattr(self.config, "enable_mean_reversion_overrides", True)
+        if not mr_overrides:
+            parabolic = None
+            post_impulse = None
+            exhaustion = None
+            fvg_fill_bias = None
+
         # ================================================================
         # PARABOLIC EXTENSION WARNING (1 Apr fix — applied before scoring)
         # When price is in a parabolic extension, late entries carry high

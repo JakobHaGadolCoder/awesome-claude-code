@@ -303,17 +303,32 @@ class VWAPAnalyzer:
         # Only score bearish momentum when price first breaks below VWAP
         # (above_vwap → below_vwap transition), not at extremes.
         # ================================================================
-        band_scores = {
-            "above_3s":  (-1.5, f"Extreme +3σ ({bands.upper_3:.2f}) — STRONG mean-reversion SHORT"),
-            "above_2s":  (-1.0, f"Above +2σ ({bands.upper_2:.2f}) — overbought, fade the extension"),
-            "above_1s":  (0.5,  f"Above +1σ ({bands.upper_1:.2f}) — bullish momentum"),
-            "above_vwap":(0.3,  f"Above VWAP ({bands.vwap:.2f}) — buyers in control"),
-            "below_vwap":(-0.3, f"Below VWAP ({bands.vwap:.2f}) — sellers in control"),
-            # FIXED: below -1σ is now BULLISH mean-reversion, not bearish momentum
-            "below_1s":  (0.5,  f"Below -1σ ({bands.lower_1:.2f}) — oversold vs VWAP, snap-back candidate"),
-            "below_2s":  (1.0,  f"Below -2σ ({bands.lower_2:.2f}) — STRONG mean-reversion LONG"),
-            "below_3s":  (1.5,  f"Below -3σ ({bands.lower_3:.2f}) — extreme capitulation, HIGH-PROB reversal"),
-        }
+        mr_overrides = getattr(self.config, "enable_mean_reversion_overrides", True)
+        if mr_overrides:
+            # Mean-reversion band scoring: fade the extremes (post-mortem fix).
+            band_scores = {
+                "above_3s":  (-1.5, f"Extreme +3σ ({bands.upper_3:.2f}) — STRONG mean-reversion SHORT"),
+                "above_2s":  (-1.0, f"Above +2σ ({bands.upper_2:.2f}) — overbought, fade the extension"),
+                "above_1s":  (0.5,  f"Above +1σ ({bands.upper_1:.2f}) — bullish momentum"),
+                "above_vwap":(0.3,  f"Above VWAP ({bands.vwap:.2f}) — buyers in control"),
+                "below_vwap":(-0.3, f"Below VWAP ({bands.vwap:.2f}) — sellers in control"),
+                # below -1σ is BULLISH mean-reversion, not bearish momentum
+                "below_1s":  (0.5,  f"Below -1σ ({bands.lower_1:.2f}) — oversold vs VWAP, snap-back candidate"),
+                "below_2s":  (1.0,  f"Below -2σ ({bands.lower_2:.2f}) — STRONG mean-reversion LONG"),
+                "below_3s":  (1.5,  f"Below -3σ ({bands.lower_3:.2f}) — extreme capitulation, HIGH-PROB reversal"),
+            }
+        else:
+            # Momentum band scoring: extension confirms the move (pre-fix behaviour).
+            band_scores = {
+                "above_3s":  (1.5,  f"Extreme +3σ ({bands.upper_3:.2f}) — strong upside momentum"),
+                "above_2s":  (1.0,  f"Above +2σ ({bands.upper_2:.2f}) — strong upside momentum"),
+                "above_1s":  (0.5,  f"Above +1σ ({bands.upper_1:.2f}) — bullish momentum"),
+                "above_vwap":(0.3,  f"Above VWAP ({bands.vwap:.2f}) — buyers in control"),
+                "below_vwap":(-0.3, f"Below VWAP ({bands.vwap:.2f}) — sellers in control"),
+                "below_1s":  (-0.5, f"Below -1σ ({bands.lower_1:.2f}) — bearish momentum"),
+                "below_2s":  (-1.0, f"Below -2σ ({bands.lower_2:.2f}) — strong downside momentum"),
+                "below_3s":  (-1.5, f"Below -3σ ({bands.lower_3:.2f}) — strong downside momentum"),
+            }
 
         if ctx.band_position in band_scores and not ctx.is_reclaim and not ctx.is_rejection:
             s, desc = band_scores[ctx.band_position]
@@ -330,8 +345,8 @@ class VWAPAnalyzer:
             score -= slope_weight
             reasons.append(f"VWAP falling (slope={bands.slope:+.3f}) — bearish drift")
 
-        # --- Extension warning (now generates an actionable signal) ---
-        if ctx.is_extended:
+        # --- Extension warning (mean-reversion snap-back signal) ---
+        if ctx.is_extended and mr_overrides:
             sign = "above" if ctx.deviation_pct > 0 else "below"
             ext_pct = abs(ctx.deviation_pct) * 100
             if ctx.deviation_pct < 0:

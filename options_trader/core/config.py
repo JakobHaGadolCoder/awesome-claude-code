@@ -55,6 +55,15 @@ class TradingConfig:
     ema_medium: int = 21
     ema_long: int = 50
 
+    # --- Mean-reversion overrides (post-mortem behaviour) ---
+    # Master switch for the contested "fade-the-extreme" logic added by the
+    # 30 Mar / 31 Mar / 1 Apr post-mortems: price-action parabolic dampener,
+    # exhaustion/capitulation reversal, post-impulse correction bias, FVG-fill
+    # magnet, and the VWAP band-position mean-reversion flip (+ extension MR
+    # signal). When False the engine reverts to pure trend/momentum behaviour
+    # at extremes. Exposed so the backtester can A/B the two regimes.
+    enable_mean_reversion_overrides: bool = True
+
     # --- Support/Resistance ---
     sr_lookback_days: int = 90
     sr_min_touches: int = 2
