@@ -93,12 +93,19 @@ class DivergenceDetector:
         df.columns = [c.lower() for c in df.columns]
         close = df["close"].reset_index(drop=True)
 
+        # Minimum price separation for a pivot pair to count as a genuine swing.
+        # Without this, two pivots that differ by a fraction of a point on a
+        # flat/quiet stretch register as a "divergence" and a single such event
+        # is enough to flip the combined signal to BUY/SELL. We require the two
+        # swing prices to differ by at least 0.5 x ATR(14).
+        min_sep = 0.5 * self._atr(df)
+
         # Compute oscillators
         rsi = self._rsi(close)
         macd_hist = self._macd_histogram(close)
 
-        rsi_divs   = self._detect_divergences(close, rsi, "RSI")
-        macd_divs  = self._detect_divergences(close, macd_hist, "MACD")
+        rsi_divs   = self._detect_divergences(close, rsi, "RSI", min_sep)
+        macd_divs  = self._detect_divergences(close, macd_hist, "MACD", min_sep)
 
         # Filter to recent events only (within last 20 bars)
         n = len(close)
@@ -135,16 +142,21 @@ class DivergenceDetector:
         price: pd.Series,
         oscillator: pd.Series,
         indicator_name: str,
+        min_price_sep: float = 0.0,
     ) -> List[DivergenceEvent]:
         events: List[DivergenceEvent] = []
 
         price_arr = price.values
         osc_arr = oscillator.values
 
-        # Find local lows and highs
+        # Find local lows and highs.
+        # Use STRICT comparators (np.less / np.greater). The previous version
+        # used np.less_equal / np.greater_equal, which flags every bar on a
+        # flat stretch as a pivot — manufacturing dozens of phantom pivots
+        # (and therefore phantom divergences) on quiet or repeated-price data.
         order = self.pivot_order
-        lows_idx  = argrelextrema(price_arr, np.less_equal,    order=order)[0]
-        highs_idx = argrelextrema(price_arr, np.greater_equal, order=order)[0]
+        lows_idx  = argrelextrema(price_arr, np.less,    order=order)[0]
+        highs_idx = argrelextrema(price_arr, np.greater, order=order)[0]
 
         # --- Regular Bullish: price lower-low, osc higher-low ---
         events += self._scan_pairs(
@@ -152,6 +164,7 @@ class DivergenceDetector:
             price_lower=True, osc_lower=False,
             div_type="bullish_regular",
             indicator=indicator_name,
+            min_price_sep=min_price_sep,
         )
 
         # --- Regular Bearish: price higher-high, osc lower-high ---
@@ -160,6 +173,7 @@ class DivergenceDetector:
             price_lower=False, osc_lower=True,
             div_type="bearish_regular",
             indicator=indicator_name,
+            min_price_sep=min_price_sep,
         )
 
         # --- Hidden Bullish: price higher-low, osc lower-low ---
@@ -168,6 +182,7 @@ class DivergenceDetector:
             price_lower=False, osc_lower=True,
             div_type="bullish_hidden",
             indicator=indicator_name,
+            min_price_sep=min_price_sep,
         )
 
         # --- Hidden Bearish: price lower-high, osc higher-high ---
@@ -176,6 +191,7 @@ class DivergenceDetector:
             price_lower=True, osc_lower=False,
             div_type="bearish_hidden",
             indicator=indicator_name,
+            min_price_sep=min_price_sep,
         )
 
         return events
@@ -189,49 +205,61 @@ class DivergenceDetector:
         osc_lower: bool,
         div_type: str,
         indicator: str,
+        min_price_sep: float = 0.0,
         max_gap: int = 40,
         min_gap: int = 5,
     ) -> List[DivergenceEvent]:
         events = []
         n = len(pivot_indices)
-        for i in range(n - 1):
-            for j in range(i + 1, n):
-                idx1, idx2 = pivot_indices[i], pivot_indices[j]
-                gap = idx2 - idx1
-                if gap < min_gap or gap > max_gap:
-                    continue
+        # Compare each pivot only to its immediately preceding pivot of the
+        # same kind (consecutive pairs). The previous version compared ALL
+        # pairs within max_gap (O(n^2)), so a single swing could spawn many
+        # overlapping "divergences" that were then summed in _build_signal,
+        # massively over-stating conviction. Textbook divergence is measured
+        # between two adjacent swing points.
+        for j in range(1, n):
+            i = j - 1
+            idx1, idx2 = pivot_indices[i], pivot_indices[j]
+            gap = idx2 - idx1
+            if gap < min_gap or gap > max_gap:
+                continue
 
-                p1, p2 = price[idx1], price[idx2]
-                o1, o2 = osc[idx1], osc[idx2]
+            p1, p2 = price[idx1], price[idx2]
+            o1, o2 = osc[idx1], osc[idx2]
 
-                if np.isnan(o1) or np.isnan(o2):
-                    continue
+            if np.isnan(o1) or np.isnan(o2):
+                continue
 
-                price_cond = (p2 < p1) if price_lower else (p2 > p1)
-                osc_cond   = (o2 > o1) if not osc_lower else (o2 < o1)
+            # Reject negligible price swings (noise) — the two pivots must be a
+            # meaningful distance apart to constitute a real higher-high / lower-low.
+            if abs(p2 - p1) < min_price_sep:
+                continue
 
-                if price_cond and osc_cond:
-                    price_diff = abs(p2 - p1) / (abs(p1) + 1e-9)
-                    osc_diff   = abs(o2 - o1) / (max(abs(o1), abs(o2)) + 1e-9)
-                    confidence = min(0.95, 0.50 + 0.25 * min(price_diff / 0.01, 1.0) + 0.25 * min(osc_diff / 0.2, 1.0))
+            price_cond = (p2 < p1) if price_lower else (p2 > p1)
+            osc_cond   = (o2 > o1) if not osc_lower else (o2 < o1)
 
-                    desc = (
-                        f"{indicator} {div_type.replace('_', ' ').title()}: "
-                        f"price {'↓' if price_lower else '↑'} {p1:.2f}→{p2:.2f}, "
-                        f"{indicator} {'↑' if not osc_lower else '↓'} {o1:.2f}→{o2:.2f}"
-                    )
-                    events.append(DivergenceEvent(
-                        divergence_type=div_type,
-                        indicator=indicator,
-                        price_point_1=float(p1),
-                        price_point_2=float(p2),
-                        osc_point_1=float(o1),
-                        osc_point_2=float(o2),
-                        bar_index_1=int(idx1),
-                        bar_index_2=int(idx2),
-                        confidence=confidence,
-                        description=desc,
-                    ))
+            if price_cond and osc_cond:
+                price_diff = abs(p2 - p1) / (abs(p1) + 1e-9)
+                osc_diff   = abs(o2 - o1) / (max(abs(o1), abs(o2)) + 1e-9)
+                confidence = min(0.95, 0.50 + 0.25 * min(price_diff / 0.01, 1.0) + 0.25 * min(osc_diff / 0.2, 1.0))
+
+                desc = (
+                    f"{indicator} {div_type.replace('_', ' ').title()}: "
+                    f"price {'↓' if price_lower else '↑'} {p1:.2f}→{p2:.2f}, "
+                    f"{indicator} {'↑' if not osc_lower else '↓'} {o1:.2f}→{o2:.2f}"
+                )
+                events.append(DivergenceEvent(
+                    divergence_type=div_type,
+                    indicator=indicator,
+                    price_point_1=float(p1),
+                    price_point_2=float(p2),
+                    osc_point_1=float(o1),
+                    osc_point_2=float(o2),
+                    bar_index_1=int(idx1),
+                    bar_index_2=int(idx2),
+                    confidence=confidence,
+                    description=desc,
+                ))
         return events
 
     # ------------------------------------------------------------------
@@ -304,6 +332,20 @@ class DivergenceDetector:
         avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
         return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def _atr(df: pd.DataFrame, period: int = 14) -> float:
+        """ATR(14) in price units; falls back to close-to-close volatility."""
+        if {"high", "low"}.issubset(df.columns):
+            high, low, prev_close = df["high"], df["low"], df["close"].shift(1)
+            tr = pd.concat(
+                [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+                axis=1,
+            ).max(axis=1)
+            atr = tr.ewm(com=period - 1, min_periods=1).mean().iloc[-1]
+        else:
+            atr = df["close"].diff().abs().rolling(period, min_periods=1).mean().iloc[-1]
+        return float(atr) if not np.isnan(atr) else 0.0
 
     @staticmethod
     def _macd_histogram(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:

@@ -324,24 +324,39 @@ class TechnicalAnalyzer:
     def _detect_regime(
         self, ohlcv: pd.DataFrame, signals: List[TechnicalSignal]
     ) -> MarketRegime:
-        atr_sig = next((s for s in signals if s.indicator == "ATR"), None)
-        ema_sig = next((s for s in signals if s.indicator == "EMA_Confluence"), None)
-
-        if atr_sig and atr_sig.value > 0.025:
-            return MarketRegime.HIGH_VOLATILITY
-
+        # ------------------------------------------------------------------
+        # Timeframe-agnostic regime detection (accuracy fix).
+        #
+        # The previous version compared ATR-as-%-of-price against absolute
+        # thresholds (0.025 / 0.008) and EMA50 slope against 1% over 10 bars.
+        # Those constants are calibrated for *daily equity* bars. On intraday
+        # gold (M15/H1) ATR is ~0.1% of price, so every bar was forced into
+        # LOW_VOLATILITY and trends were never detected. We now measure both
+        # volatility and trend *relative to the instrument's own recent ATR*,
+        # which works on any symbol/timeframe.
+        # ------------------------------------------------------------------
         close = ohlcv["close"]
+        atr = self._atr(ohlcv, self.config.atr_period)
+        atr_now = float(atr.iloc[-1])
+        atr_avg = float(atr.rolling(50).mean().iloc[-1])
+        if np.isnan(atr_avg) or atr_avg == 0:
+            atr_avg = float(atr.rolling(20).mean().iloc[-1]) or atr_now
+        atr_ratio = atr_now / atr_avg if atr_avg else 1.0
+
+        # Slope of EMA50 expressed in ATR units (how many ATRs price has
+        # trended over the last 10 bars). >1 ATR = a real directional drift.
         ema50 = self._ema(close, 50)
-        slope = float(ema50.iloc[-1] - ema50.iloc[-10]) / float(ema50.iloc[-10]) if float(ema50.iloc[-10]) else 0
+        slope_abs = float(ema50.iloc[-1] - ema50.iloc[-10]) if len(ema50) >= 10 else 0.0
+        slope_atr = slope_abs / atr_now if atr_now else 0.0
 
-        if slope > 0.01:
+        if atr_ratio > 1.6:
+            return MarketRegime.HIGH_VOLATILITY
+        if slope_atr > 1.0:
             return MarketRegime.TRENDING_UP
-        elif slope < -0.01:
+        if slope_atr < -1.0:
             return MarketRegime.TRENDING_DOWN
-
-        if atr_sig and atr_sig.value < 0.008:
+        if atr_ratio < 0.65:
             return MarketRegime.LOW_VOLATILITY
-
         return MarketRegime.RANGING
 
     # ------------------------------------------------------------------

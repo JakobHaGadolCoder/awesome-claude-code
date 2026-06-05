@@ -105,8 +105,11 @@ class SupportResistanceAnalyzer:
         lows = ohlcv["low"].values
         order = 5  # look 5 bars either side
 
-        high_indices = argrelextrema(highs, np.greater_equal, order=order)[0]
-        low_indices = argrelextrema(lows, np.less_equal, order=order)[0]
+        # Strict comparators: np.greater_equal/less_equal tag every bar on a
+        # flat stretch as a pivot, inflating both the pivot count and the
+        # touch counts derived from them.
+        high_indices = argrelextrema(highs, np.greater, order=order)[0]
+        low_indices = argrelextrema(lows, np.less, order=order)[0]
 
         for idx in high_indices[-20:]:  # Keep last 20 pivots
             price = float(highs[idx])
@@ -256,77 +259,49 @@ class SupportResistanceAnalyzer:
     def _periodic_highs_lows(
         self, ohlcv: pd.DataFrame
     ) -> List[SupportResistanceLevel]:
-        levels = []
-        if len(ohlcv) < 2:
+        """
+        Previous-period highs/lows (PDH/PDL, weekly, monthly).
+
+        Accuracy fix: the previous implementation treated bar[-2] as the
+        "previous day" and the last 5/22 *bars* as "weekly"/"monthly". That is
+        only valid on daily bars. On the intraday frames the CFD/MT5 pipeline
+        actually feeds (M15/H1), "previous day" became the previous 15 minutes
+        and "weekly high" the last ~75 minutes — emitting high-strength levels
+        at meaningless prices that then drive STRONG signals and TP caps.
+
+        We now resample on the real DatetimeIndex to calendar day/week/month
+        and take each genuinely *completed* prior period's extreme. If the
+        index is not datetime-based, or doesn't span enough periods, the
+        corresponding level is simply skipped rather than fabricated.
+        """
+        levels: List[SupportResistanceLevel] = []
+        if len(ohlcv) < 2 or not isinstance(ohlcv.index, pd.DatetimeIndex):
             return levels
 
-        # Previous day
-        pdh = float(ohlcv["high"].iloc[-2])
-        pdl = float(ohlcv["low"].iloc[-2])
-        levels.append(
-            SupportResistanceLevel(
-                price=pdh,
-                level_type="resistance",
-                strength=0.75,
-                timeframe="daily",
-                description="Previous Day High (PDH)",
-            )
-        )
-        levels.append(
-            SupportResistanceLevel(
-                price=pdl,
-                level_type="support",
-                strength=0.75,
-                timeframe="daily",
-                description="Previous Day Low (PDL)",
-            )
-        )
-
-        # Weekly high/low (last 5 bars)
-        if len(ohlcv) >= 5:
-            wh = float(ohlcv["high"].iloc[-5:].max())
-            wl = float(ohlcv["low"].iloc[-5:].min())
-            levels.append(
-                SupportResistanceLevel(
-                    price=wh,
-                    level_type="resistance",
-                    strength=0.8,
-                    timeframe="weekly",
-                    description="Weekly High",
-                )
-            )
-            levels.append(
-                SupportResistanceLevel(
-                    price=wl,
-                    level_type="support",
-                    strength=0.8,
-                    timeframe="weekly",
-                    description="Weekly Low",
-                )
-            )
-
-        # Monthly high/low (last 22 bars)
-        if len(ohlcv) >= 22:
-            mh = float(ohlcv["high"].iloc[-22:].max())
-            ml = float(ohlcv["low"].iloc[-22:].min())
-            levels.append(
-                SupportResistanceLevel(
-                    price=mh,
-                    level_type="resistance",
-                    strength=0.85,
-                    timeframe="monthly",
-                    description="Monthly High",
-                )
-            )
-            levels.append(
-                SupportResistanceLevel(
-                    price=ml,
-                    level_type="support",
-                    strength=0.85,
-                    timeframe="monthly",
-                    description="Monthly Low",
-                )
-            )
+        specs = [
+            ("D",  "daily",   0.75, "Previous Day"),
+            ("W",  "weekly",  0.80, "Previous Week"),
+            ("ME", "monthly", 0.85, "Previous Month"),
+        ]
+        for rule, tf, strength, label in specs:
+            try:
+                agg = ohlcv.resample(rule).agg({"high": "max", "low": "min"}).dropna()
+            except Exception:
+                continue
+            # Need at least one *completed* prior period (exclude the in-progress
+            # current period, which is the last row).
+            if len(agg) < 2:
+                continue
+            prev = agg.iloc[-2]
+            ph, pl = float(prev["high"]), float(prev["low"])
+            levels.append(SupportResistanceLevel(
+                price=ph, level_type="resistance", strength=strength,
+                timeframe=tf, description=f"{label} High",
+            ))
+            levels.append(SupportResistanceLevel(
+                price=pl, level_type="support", strength=strength,
+                timeframe=tf, description=f"{label} Low",
+            ))
 
         return levels
 
@@ -567,12 +542,37 @@ class SupportResistanceAnalyzer:
     # ------------------------------------------------------------------
 
     def _count_touches(self, ohlcv: pd.DataFrame, price: float) -> int:
+        """
+        Count distinct *approaches/rejections* of a level, not bars that merely
+        contain it.
+
+        Accuracy fix: the previous implementation incremented for every bar
+        whose [low, high] straddled the price. For a level near the middle of
+        the data, almost every bar contains it, yielding absurd counts like
+        "touched 51x" and saturating strength to 1.0 — which then triggers
+        STRONG_BUY/SELL signals and TP-capping at meaningless levels.
+
+        A real touch is a bar that *reaches into* the zone with its wick and
+        then leaves it. We therefore (a) only count bars whose high OR low is
+        within the zone of the level (a genuine test, not an engulfing bar),
+        and (b) de-bounce consecutive in-zone bars so one multi-bar visit
+        counts once.
+        """
         zone = price * self.config.sr_zone_pct
-        count = 0
-        for _, row in ohlcv.iterrows():
-            if row["low"] - zone <= price <= row["high"] + zone:
-                count += 1
-        return count
+        highs = ohlcv["high"].values
+        lows = ohlcv["low"].values
+        touches = 0
+        in_zone_prev = False
+        for hi, lo in zip(highs, lows):
+            # Bar must approach the level (a wick within the zone) without the
+            # whole body having blown through it long ago.
+            high_near = abs(hi - price) <= zone
+            low_near = abs(lo - price) <= zone
+            in_zone = (high_near or low_near) and (lo - zone <= price <= hi + zone)
+            if in_zone and not in_zone_prev:
+                touches += 1
+            in_zone_prev = in_zone
+        return touches
 
     def _merge_nearby_levels(
         self, levels: List[SupportResistanceLevel], current_price: float

@@ -287,8 +287,14 @@ class MT5LiveBot:
             # Events (stub for CFD — no options events)
             _, event_signal = self.events_analyzer.analyze(symbol)
 
-            # Order flow (stub for CFD)
-            flow_signal = tech_signals[0] if tech_signals else self._neutral_signal("OrderFlow")
+            # Order flow: there is no options-chain order flow for a spot CFD.
+            # The previous stub reused tech_signals[0] (the RSI signal), which
+            # silently double-counted RSI at the heaviest weight in the
+            # aggregator (weight_order_flow = 0.30) AND fed it again through
+            # technical_score and additional_signals. We pass an explicit
+            # NEUTRAL signal so order flow contributes nothing rather than
+            # masquerading as independent confirmation.
+            flow_signal = self._neutral_signal("OrderFlow(CFD-n/a)")
 
             # Session
             session_info = self.session_filter.analyze(symbol)
@@ -465,16 +471,22 @@ class MT5LiveBot:
         if len(df) < 3:
             return full_mult
 
+        # Measure the DIRECTIONAL move already completed in the trade direction,
+        # not the full high-low range of the window.
+        #
+        # Accuracy fix: the previous version used (high.max - low.min) for both
+        # BUY and SELL, i.e. the total range. In a choppy sideways window that
+        # range can be several ATRs even with zero net progress, so the TP
+        # multiplier was cut (and R:R failed) on perfectly fresh entries. A
+        # "late" entry means price has already travelled *in our direction*:
+        #   BUY  -> distance from the window low up to the entry (current close)
+        #   SELL -> distance from the window high down to the entry
+        entry = float(df["close"].iloc[-1])
         if is_buy:
-            # For BUY: measure how far price has already fallen (prior bear move)
-            prior_high = float(df["high"].max())
-            prior_low  = float(df["low"].min())
-            prior_move = prior_high - prior_low
+            prior_move = entry - float(df["low"].min())
         else:
-            # For SELL: measure how far price has already risen (prior bull move)
-            prior_high = float(df["high"].max())
-            prior_low  = float(df["low"].min())
-            prior_move = prior_high - prior_low
+            prior_move = float(df["high"].max()) - entry
+        prior_move = max(0.0, prior_move)
 
         prior_atr_ratio = prior_move / atr
 
