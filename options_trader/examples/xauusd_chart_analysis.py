@@ -21,15 +21,7 @@ import numpy as np, pandas as pd
 from datetime import datetime, timezone
 
 from options_trader.core.config import TradingConfig
-from options_trader.core.models import SignalStrength, TechnicalSignal
-from options_trader.analyzers.technical import TechnicalAnalyzer
-from options_trader.analyzers.support_resistance import SupportResistanceAnalyzer
-from options_trader.analyzers.events import EventsAnalyzer
-from options_trader.analyzers.price_action import PriceActionAnalyzer
-from options_trader.analyzers.vwap import VWAPAnalyzer
-from options_trader.analyzers.multi_timeframe import MultiTimeframeAnalyzer
-from options_trader.analyzers.divergence import DivergenceDetector
-from options_trader.strategies.signal_aggregator import SignalAggregator
+from options_trader.reporting import analyze_and_print
 
 SYMBOL = "XAUUSD"
 
@@ -62,8 +54,6 @@ H1_VIS = [
     (4471,4475,4469,4473),(4473,4474,4460,4461),
 ]
 
-IS_BUY = True  # set by params(); used by late_entry_mult()
-
 
 def _walk(n, start, step_std, wick_std, drift, seed):
     """Generate n realistic OHLC candles via a drifting random walk."""
@@ -93,50 +83,9 @@ def build_frame(visible, lead_n, freq_min, end_dt, step_std, wick_std,
     return df
 
 
-def atr14(df):
-    h, l, c = df["high"].values, df["low"].values, df["close"].values
-    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1, len(df))]
-    return float(sum(trs[-14:]) / 14)
-
-
 def resample(df, rule):
     return df.resample(rule).agg({"open": "first", "high": "max", "low": "min",
                                   "close": "last", "volume": "sum"}).dropna()
-
-
-def late_entry_mult(df, atr, is_buy, lookback=10, full=2.5, mn=1.2):
-    d = df.tail(lookback); entry = float(d["close"].iloc[-1])
-    pm = (entry - float(d["low"].min())) if is_buy else (float(d["high"].max()) - entry)
-    pm = max(0.0, pm); r = pm / atr if atr else 0.0
-    if r <= 1.5:
-        return full, r
-    red = min(0.5, (r - 1.5) * 0.15)
-    return round(max(mn, full - red * full), 1), r
-
-
-def cap_tp(entry, tp, is_buy, levels, buf=0.001):
-    if is_buy:
-        block = [lv for lv in levels if lv.level_type == "resistance"
-                 and entry < lv.price < tp and lv.strength >= 0.75]
-        if block:
-            nr = min(block, key=lambda x: x.price); return round(nr.price*(1-buf), 2), nr
-    else:
-        block = [lv for lv in levels if lv.level_type == "support"
-                 and tp < lv.price < entry and lv.strength >= 0.75]
-        if block:
-            nr = max(block, key=lambda x: x.price); return round(nr.price*(1+buf), 2), nr
-    return tp, None
-
-
-def params(df, is_buy, entry, levels):
-    atr = atr14(df); tp_mult, ratio = late_entry_mult(df, atr, is_buy)
-    if is_buy:
-        sl = round(entry-1.5*atr, 2); tp1 = round(entry+tp_mult*atr, 2)
-    else:
-        sl = round(entry+1.5*atr, 2); tp1 = round(entry-tp_mult*atr, 2)
-    capped, lv = cap_tp(entry, tp1, is_buy, levels)
-    risk = abs(entry-sl); rew = abs(entry-capped); rr = rew/risk if risk else 0.0
-    return dict(atr=atr, tp_mult=tp_mult, ratio=ratio, sl=sl, tp1=capped, cap=lv, rr=rr)
 
 
 def main():
@@ -153,86 +102,10 @@ def main():
                      step_std=6.0, wick_std=3.2, lead_drift=0.035, lead_seed=23)
     ohlcv_by_tf = {"M15": m15, "H1": h1, "H4": resample(h1, "4h"),
                    "D1": resample(h1, "1D"), "W1": resample(h1, "1W")}
-    price = float(m15["close"].iloc[-1])
 
-    cfg = TradingConfig()
-    tech, sr, ev = TechnicalAnalyzer(cfg), SupportResistanceAnalyzer(cfg), EventsAnalyzer(cfg)
-    pa, vw, mtf = PriceActionAnalyzer(cfg), VWAPAnalyzer(cfg), MultiTimeframeAnalyzer(cfg)
-    dv, agg = DivergenceDetector(cfg), SignalAggregator(cfg)
-
-    tech_signals, regime, tech_score = tech.analyze(SYMBOL, m15)
-    pa_res = pa.analyze(SYMBOL, m15, price)
-    _, vwap_ctx, vwap_sig = vw.analyze(SYMBOL, m15, session_reset=True)
-    mtf_res = mtf.analyze(SYMBOL, ohlcv_by_tf)
-    div_res = dv.analyze(SYMBOL, m15)
-    sr_levels, sr_sig = sr.analyze(SYMBOL, m15, price)
-    _, ev_sig = ev.analyze(SYMBOL)
-
-    # Order flow is N/A for a spot CFD -> NEUTRAL (do not double-count RSI).
-    flow_sig = TechnicalSignal(indicator="OrderFlow(CFD-n/a)", value=0.0,
-                               signal=SignalStrength.NEUTRAL, description="N/A for spot CFD")
-
-    agg_sig = agg.aggregate(
-        symbol=SYMBOL, order_flow_signal=flow_sig, technical_score=tech_score,
-        sr_signal=sr_sig, event_signal=ev_sig, regime=regime,
-        price_action_signal=pa_res.signal, vwap_signal=vwap_sig,
-        mtf_signal=mtf_res.signal, divergence_signal=div_res.combined_signal,
-        correlation_signal=None, session_signal=None, additional_signals=tech_signals,
-    )
-    parabolic = pa._detect_parabolic_extension(m15)
-    post_imp = pa._detect_post_impulse_correction(m15)
-
-    print("="*72)
-    print(f"  XAUUSD ENGINE RUN  |  price={price:.2f}  |  regime={regime.value}  "
-          f"|  M15 ATR={atr14(m15):.2f}  H1 ATR={atr14(h1):.2f}")
-    print("="*72)
-    print(f"Technical composite : {tech_score:+.2f}")
-    for s in tech_signals:
-        print(f"   {s.indicator:14s} {s.signal.name:12s} {s.description}")
-    print("-"*72)
-    print(f"PriceAction         : {pa_res.signal.signal.name}  (score={pa_res.signal.value:+.2f})  "
-          f"structure={pa_res.structure.trend}")
-    print(f"   exhaustion   : {pa_res.exhaustion.description if pa_res.exhaustion else 'none'}")
-    print(f"   fvg_fill     : {pa_res.fvg_fill_bias}")
-    print(f"   parabolic    : {parabolic['description'] if parabolic else 'none'}")
-    print(f"   post_impulse : {post_imp['description'] if post_imp else 'none'}")
-    print("-"*72)
-    print(f"VWAP                : {vwap_sig.signal.name}  vwap={vwap_ctx.vwap:.2f}  "
-          f"dev={vwap_ctx.deviation_pct*100:+.2f}%  band={vwap_ctx.band_position}  "
-          f"trend={vwap_ctx.vwap_trend}  reclaim={vwap_ctx.is_reclaim}  reject={vwap_ctx.is_rejection}")
-    print("-"*72)
-    print(f"MTF                 : htf_bias={mtf_res.htf_bias}  ltf_aligned={mtf_res.ltf_aligned}  "
-          f"confluence={mtf_res.confluence_score:.0%}  can_trade={mtf_res.can_trade}")
-    for tf in ("W1", "D1", "H4", "H1", "M15"):
-        b = mtf_res.timeframe_biases.get(tf)
-        if b:
-            print(f"   {tf:4s} {b.trend:8s} score={b.score:+.2f} rsi={b.rsi:.0f} ema_aligned={b.ema_aligned}")
-    print(f"   suppression: {mtf_res.suppression_reason or 'none'}")
-    print("-"*72)
-    print(f"Divergence          : {div_res.combined_signal.signal.name}  "
-          f"RSI_divs={len(div_res.rsi_divergences)} MACD_divs={len(div_res.macd_divergences)}")
-    nearest = min(sr_levels, key=lambda lv: abs(lv.price - price)) if sr_levels else None
-    print(f"S/R                 : {sr_sig.signal.name} — {sr_sig.description[:66]}")
-    if nearest:
-        print(f"   nearest level: {nearest.level_type} @ {nearest.price:.2f} "
-              f"(strength={nearest.strength:.2f}) {nearest.description}")
-    print("="*72)
-    print(f"  AGGREGATED   : {agg_sig.direction.name}   score={agg_sig.composite_score:+.3f}   "
-          f"confidence={agg_sig.confidence*100:.1f}%  (min={cfg.min_confidence*100:.0f}%)")
-    neutral = agg_sig.direction == SignalStrength.NEUTRAL
-    print(f"  GATES: signal!=neutral={not neutral} | conf>=min={agg_sig.confidence >= cfg.min_confidence} "
-          f"| mtf_aligned={mtf_res.ltf_aligned} | mtf_can_trade={mtf_res.can_trade}")
-    print("="*72)
-    print("\n  TRADE-PARAM MATH (1.5xATR stop, directional late-entry TP scaling, SR cap, min RR=1.5)")
-    for is_buy, label in [(True, "HYPOTHETICAL LONG"), (False, "HYPOTHETICAL SHORT")]:
-        for tf_name, df in [("M15", m15), ("H1", h1)]:
-            p = params(df, is_buy, price, sr_levels)
-            ok = p["rr"] >= cfg.min_risk_reward
-            cap = f" capped@{p['cap'].price:.2f}({p['cap'].description[:22]})" if p['cap'] else ""
-            print(f"  {label:18s} [{tf_name}] ATR={p['atr']:.2f} dirMove/ATR={p['ratio']:.2f}  "
-                  f"TPx={p['tp_mult']}  SL={p['sl']:.2f} TP1={p['tp1']:.2f}{cap}  "
-                  f"R:R={p['rr']:.2f} -> {'ACCEPT' if ok else 'REJECT (<1.5)'}")
-    print("="*72)
+    # Delegate the pipeline + report to the shared reporting module (same code
+    # path as the real-CSV runner, examples/analyze_csv.py).
+    analyze_and_print(SYMBOL, ohlcv_by_tf, config=TradingConfig())
 
 
 if __name__ == "__main__":

@@ -115,6 +115,33 @@ def test_range_filter_modes():
     assert range_stand_aside(R, "reversal_only", False, "above_vwap", SignalStrength.SELL) is False
 
 
+def test_csv_loader_comma_and_tab(tmp_path):
+    """Loader normalises both the export-script CSV and MT5's tab export."""
+    from options_trader.utils.csv_loader import load_ohlcv_csv
+
+    comma = tmp_path / "x.csv"
+    comma.write_text(
+        "time,open,high,low,close,volume\n"
+        "2026-06-04 10:00:00+00:00,4500,4505,4498,4502,1200\n"
+        "2026-06-04 10:15:00+00:00,4502,4506,4500,4501,900\n"
+    )
+    df = load_ohlcv_csv(str(comma))
+    assert list(df.columns) == ["open", "high", "low", "close", "volume"]
+    assert isinstance(df.index, pd.DatetimeIndex) and len(df) == 2
+    assert float(df["close"].iloc[0]) == 4502.0   # positional assignment, not NaN
+
+    # MT5 manual "Export Bars" style: tab-separated, <DATE> <TIME> <TICKVOL>
+    tab = tmp_path / "y.csv"
+    tab.write_text(
+        "<DATE>\t<TIME>\t<OPEN>\t<HIGH>\t<LOW>\t<CLOSE>\t<TICKVOL>\t<VOL>\t<SPREAD>\n"
+        "2026.06.04\t10:00:00\t4500\t4505\t4498\t4502\t1200\t0\t20\n"
+        "2026.06.04\t10:15:00\t4502\t4506\t4500\t4501\t900\t0\t20\n"
+    )
+    df2 = load_ohlcv_csv(str(tab))
+    assert list(df2.columns) == ["open", "high", "low", "close", "volume"]
+    assert len(df2) == 2 and float(df2["volume"].iloc[0]) == 1200.0
+
+
 def test_cfd_backtester_runs_and_reports():
     """Smoke: the bar-by-bar CFD backtester returns computable R stats."""
     closes = 4400 + np.cumsum(0.6 + np.random.default_rng(5).normal(0, 2.0, 200))
