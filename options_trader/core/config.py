@@ -64,6 +64,15 @@ class TradingConfig:
     # at extremes. Exposed so the backtester can A/B the two regimes.
     enable_mean_reversion_overrides: bool = True
 
+    # Regime stand-aside filter (prototype) for the RANGING regime, where the
+    # backtest shows the system bleeds. Modes:
+    #   "off"           no filtering (default — preserves existing behaviour)
+    #   "block_all"     take no new entries while RANGING
+    #   "reversal_only" allow only mean-reversion fades at an edge (BUY at the
+    #                   lower VWAP band / support, SELL at the upper band /
+    #                   resistance); block mid-range trend-continuation
+    range_filter_mode: str = "off"
+
     # --- Support/Resistance ---
     sr_lookback_days: int = 90
     sr_min_touches: int = 2

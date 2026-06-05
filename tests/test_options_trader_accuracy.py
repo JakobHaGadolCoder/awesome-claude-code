@@ -96,6 +96,25 @@ def test_mean_reversion_toggle_changes_vwap_signal():
     assert sig_on.value > sig_off.value
 
 
+def test_range_filter_modes():
+    """The regime stand-aside filter behaves per mode."""
+    from options_trader.strategies.regime_filter import range_stand_aside
+    R = MarketRegime.RANGING
+    T = MarketRegime.TRENDING_UP
+
+    # off: never suppresses
+    assert range_stand_aside(R, "off", True, "above_vwap", SignalStrength.NEUTRAL) is False
+    # non-ranging regime: never suppresses, any mode
+    assert range_stand_aside(T, "block_all", True, "above_vwap", SignalStrength.NEUTRAL) is False
+    # block_all: suppresses every ranging entry
+    assert range_stand_aside(R, "block_all", False, "below_2s", SignalStrength.STRONG_BUY) is True
+    # reversal_only: allow a fade at the edge, block a mid-range chase
+    assert range_stand_aside(R, "reversal_only", True, "below_2s", SignalStrength.NEUTRAL) is False
+    assert range_stand_aside(R, "reversal_only", True, "above_vwap", SignalStrength.NEUTRAL) is True
+    # reversal_only: a short at resistance is allowed
+    assert range_stand_aside(R, "reversal_only", False, "above_vwap", SignalStrength.SELL) is False
+
+
 def test_cfd_backtester_runs_and_reports():
     """Smoke: the bar-by-bar CFD backtester returns computable R stats."""
     closes = 4400 + np.cumsum(0.6 + np.random.default_rng(5).normal(0, 2.0, 200))

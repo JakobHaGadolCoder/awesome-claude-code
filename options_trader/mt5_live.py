@@ -49,6 +49,7 @@ from options_trader.analyzers.multi_timeframe import MultiTimeframeAnalyzer
 from options_trader.analyzers.divergence import DivergenceDetector
 from options_trader.analyzers.correlation import CorrelationAnalyzer
 from options_trader.strategies.signal_aggregator import SignalAggregator, AggregatedSignal
+from options_trader.strategies.regime_filter import range_stand_aside
 from options_trader.utils.logger import setup_logger
 from options_trader.utils.mt5_connector import MT5Connector
 from options_trader.utils.mt5_executor import MT5Executor, MT5Position, OrderResult
@@ -221,6 +222,15 @@ class MT5LiveBot:
             logger.info("%s: correlation suppression — skip entry", symbol)
             return
 
+        # Regime stand-aside gate (configurable; see TradingConfig).
+        if range_stand_aside(
+            meta.get("regime"), self.config.range_filter_mode,
+            direction in (SignalStrength.BUY, SignalStrength.STRONG_BUY),
+            meta.get("vwap_band", ""), meta.get("sr_signal", SignalStrength.NEUTRAL),
+        ):
+            logger.info("%s: RANGING stand-aside filter — skip entry", symbol)
+            return
+
         # 7. Calculate SL/TP from ATR, capped at nearest S/R
         sl, tp1, tp2, lot_size = self._calculate_trade_params(
             symbol, ohlcv, direction, current_price,
@@ -283,6 +293,11 @@ class MT5LiveBot:
             # S/R — capture levels for TP capping in trade params
             sr_levels, sr_signal = self.sr_analyzer.analyze(symbol, ohlcv, current_price)
             meta["sr_levels"] = sr_levels
+
+            # Stashed for the regime stand-aside filter in _process_symbol.
+            meta["regime"] = regime
+            meta["vwap_band"] = vwap_ctx.band_position
+            meta["sr_signal"] = sr_signal.signal
 
             # Events (stub for CFD — no options events)
             _, event_signal = self.events_analyzer.analyze(symbol)

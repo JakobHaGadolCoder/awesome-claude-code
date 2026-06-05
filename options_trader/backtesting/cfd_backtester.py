@@ -33,6 +33,7 @@ from options_trader.analyzers.multi_timeframe import MultiTimeframeAnalyzer
 from options_trader.analyzers.divergence import DivergenceDetector
 from options_trader.analyzers.events import EventsAnalyzer
 from options_trader.strategies.signal_aggregator import SignalAggregator
+from options_trader.strategies.regime_filter import range_stand_aside
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +234,7 @@ class CFDBacktester:
         try:
             tech_signals, regime, tech_score = self.tech.analyze(symbol, window)
             pa_res = self.pa.analyze(symbol, window, price)
-            _, _, vwap_sig = self.vw.analyze(symbol, window, session_reset=True)
+            _, vwap_ctx, vwap_sig = self.vw.analyze(symbol, window, session_reset=True)
             mtf_res = self.mtf.analyze(symbol, self._mtf_frames(window))
             div_res = self.dv.analyze(symbol, window)
             sr_levels, sr_sig = self.sr.analyze(symbol, window, price)
@@ -261,6 +262,13 @@ class CFDBacktester:
             return None
 
         is_buy = agg.direction in _BUY
+
+        # Regime stand-aside filter (configurable; see TradingConfig).
+        if range_stand_aside(
+            regime, self.config.range_filter_mode, is_buy,
+            vwap_ctx.band_position, sr_sig.signal,
+        ):
+            return None
         atr = _atr(window)
         if atr == 0:
             return None

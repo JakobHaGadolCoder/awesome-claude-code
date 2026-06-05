@@ -1,9 +1,12 @@
 """
-A/B backtest: do the mean-reversion overrides help or hurt?
-===========================================================
+A/B backtest: mean-reversion overrides + the RANGING stand-aside filter
+=======================================================================
 Runs the CFD backtester over several synthetic but regime-labelled gold
-histories with ``enable_mean_reversion_overrides`` ON vs OFF and prints an
-R-multiple comparison.
+histories and prints an R-multiple comparison across four configs:
+    MR=ON         overrides on,  no range filter (original behaviour)
+    MR=OFF        overrides off, no range filter
+    OFF+block     overrides off + stand aside entirely while RANGING
+    OFF+reversal  overrides off + allow only mean-reversion fades in a range
 
 The hypothesis under test (from the accuracy audit): the "fade-the-extreme"
 overrides (parabolic dampener, exhaustion reversal, VWAP band flip, FVG-fill)
@@ -80,14 +83,26 @@ def main():
         "spike_and_revert": gen_spike_revert(n, seed=4),
     }
 
+    # Three configs:
+    #   MR=ON   overrides on, no range filter (original post-mortem behaviour)
+    #   MR=OFF  overrides off, no range filter (best from the prior A/B)
+    #   OFF+RF  overrides off + RANGING stand-aside filter (the prototype)
+    configs = [
+        ("MR=ON  ",        dict(enable_mean_reversion_overrides=True,  range_filter_mode="off")),
+        ("MR=OFF ",        dict(enable_mean_reversion_overrides=False, range_filter_mode="off")),
+        ("OFF+block",      dict(enable_mean_reversion_overrides=False, range_filter_mode="block_all")),
+        ("OFF+reversal",   dict(enable_mean_reversion_overrides=False, range_filter_mode="reversal_only")),
+    ]
+
     print(CFDBacktestResult.header())
     print("-" * 92)
-    agg = {"ON": [], "OFF": []}
+    agg = {tag: [] for tag, _ in configs}
     for name, df in scenarios.items():
-        for flag, tag in [(True, "ON"), (False, "OFF")]:
+        for tag, kw in configs:
             cfg = TradingConfig()
-            cfg.enable_mean_reversion_overrides = flag
-            res = CFDBacktester(cfg).run(df, label=f"{name:<17} MR={tag}")
+            for k, v in kw.items():
+                setattr(cfg, k, v)
+            res = CFDBacktester(cfg).run(df, label=f"{name:<17} {tag}")
             agg[tag].append(res)
             print(res.row())
         print("-" * 92)
@@ -96,8 +111,8 @@ def main():
     print("\nAGGREGATE ACROSS ALL REGIMES")
     print(CFDBacktestResult.header())
     print("-" * 92)
-    for tag in ("ON", "OFF"):
-        merged = CFDBacktestResult(label=f"{'ALL':<17} MR={tag}")
+    for tag, _ in configs:
+        merged = CFDBacktestResult(label=f"{'ALL':<17} {tag}")
         for r in agg[tag]:
             merged.trades.extend(r.trades)
         print(merged.row())
