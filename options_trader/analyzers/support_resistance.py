@@ -559,20 +559,19 @@ class SupportResistanceAnalyzer:
         counts once.
         """
         zone = price * self.config.sr_zone_pct
-        highs = ohlcv["high"].values
-        lows = ohlcv["low"].values
-        touches = 0
-        in_zone_prev = False
-        for hi, lo in zip(highs, lows):
-            # Bar must approach the level (a wick within the zone) without the
-            # whole body having blown through it long ago.
-            high_near = abs(hi - price) <= zone
-            low_near = abs(lo - price) <= zone
-            in_zone = (high_near or low_near) and (lo - zone <= price <= hi + zone)
-            if in_zone and not in_zone_prev:
-                touches += 1
-            in_zone_prev = in_zone
-        return touches
+        highs = ohlcv["high"].to_numpy()
+        lows = ohlcv["low"].to_numpy()
+        if highs.size == 0:
+            return 0
+        # Vectorised: a bar "approaches" the level if its high or low is within
+        # the zone, and the bar straddles the level. Count rising edges so a
+        # multi-bar visit de-bounces to a single touch.
+        in_zone = (
+            ((np.abs(highs - price) <= zone) | (np.abs(lows - price) <= zone))
+            & (lows - zone <= price) & (price <= highs + zone)
+        )
+        edges = int(np.count_nonzero(in_zone[1:] & ~in_zone[:-1]))
+        return edges + (1 if in_zone[0] else 0)
 
     def _merge_nearby_levels(
         self, levels: List[SupportResistanceLevel], current_price: float

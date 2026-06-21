@@ -174,12 +174,15 @@ class CFDBacktester:
 
     # ------------------------------------------------------------------
     def run(self, df: pd.DataFrame, label: str = "", symbol: str = "XAUUSD",
-            warmup: int = 80, max_hold: int = 48) -> CFDBacktestResult:
+            warmup: int = 80, max_hold: int = 48,
+            lookback_cap: int = 400, decision_every: int = 1) -> CFDBacktestResult:
         df = df.copy()
         df.columns = [c.lower() for c in df.columns]
         result = CFDBacktestResult(label=label)
         open_trade: Optional[CFDTrade] = None
         n = len(df)
+        last_eval = -10**9
+        step = max(1, decision_every)
 
         for i in range(warmup, n):
             bar = df.iloc[i]
@@ -196,8 +199,23 @@ class CFDBacktester:
                     open_trade = None
                 continue
 
-            # 2) Flat -> look for an entry on the closed window up to bar i
-            window = df.iloc[: i + 1]
+            # Decision cadence: only evaluate the (expensive) entry pipeline
+            # every `decision_every` bars while flat. A signal persists across
+            # several M15 bars, so this trades a little entry-timing precision
+            # for a linear speed-up; exits are still checked every bar above.
+            if i - last_eval < step:
+                continue
+            last_eval = i
+
+            # 2) Flat -> look for an entry on the closed window up to bar i.
+            # Cap the window length: the analyzers only need recent history
+            # (EMA50, MACD(26), divergence lookback 60, SR pivots, daily-reset
+            # VWAP, M15->H4 resample needing >=320 bars). Without the cap the
+            # window grows every bar, making the whole backtest O(n^2). A fixed
+            # cap makes each pipeline call O(1) in total history -> O(n) overall,
+            # with no material effect on the signals.
+            lo = max(0, i + 1 - lookback_cap)
+            window = df.iloc[lo: i + 1]
             open_trade = self._maybe_enter(symbol, window, i)
 
         # close any trade still open at the end

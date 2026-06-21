@@ -25,6 +25,9 @@ def main() -> None:
     ap.add_argument("--dir", help="directory with <SYMBOL>_M15.csv")
     ap.add_argument("--symbol", default="XAUUSD")
     ap.add_argument("--warmup", type=int, default=80)
+    ap.add_argument("--decision-every", type=int, default=1,
+                    help="evaluate entries every N bars (>1 = faster, slightly "
+                         "coarser entry timing). Try 3 for big histories.")
     args = ap.parse_args()
 
     if args.m15:
@@ -49,7 +52,8 @@ def main() -> None:
         for k, v in kw.items():
             setattr(cfg, k, v)
         res = CFDBacktester(cfg).run(m15, label=f"{args.symbol} {tag}",
-                                     symbol=args.symbol, warmup=args.warmup)
+                                     symbol=args.symbol, warmup=args.warmup,
+                                     decision_every=args.decision_every)
         print(res.row())
 
 
